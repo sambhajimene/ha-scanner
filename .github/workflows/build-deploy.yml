@@ -1,0 +1,98 @@
+name: Build, Push & Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_TAG: latest
+  IMAGE_NAME: quay.io/menesambhaji/ha-scanner
+  OPENSHIFT_PROJECT: menesambhaji-dev
+  APP_NAME: ha-scanner
+  APP_PORT: 8501
+
+jobs:
+  build_and_push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Install Buildah
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah
+
+      - name: Build Docker Image
+        env:
+          FULL_IMAGE: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        run: |
+          echo "🔨 Building image $FULL_IMAGE"
+          buildah bud -t $FULL_IMAGE .
+
+      - name: Login to Quay.io
+        run: |
+          echo "${{ secrets.QUAY_PASSWORD }}" | buildah login -u "${{ secrets.QUAY_USER }}" --password-stdin quay.io
+
+      - name: Push Docker Image
+        env:
+          FULL_IMAGE: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        run: |
+          echo "📦 Pushing image $FULL_IMAGE to Quay.io"
+          buildah push $FULL_IMAGE docker://$FULL_IMAGE
+
+  deploy:
+    name: Deploy to OpenShift
+    runs-on: ubuntu-latest
+    needs: build_and_push
+
+    steps:
+      - name: Install OC CLI
+        run: |
+          sudo curl -L https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz -o oc.tar.gz
+          sudo tar -xzf oc.tar.gz -C /usr/local/bin oc
+          oc version
+
+      - name: Login to OpenShift
+        run: |
+          echo "🔐 Login to OpenShift"
+          oc login ${{ secrets.OPENSHIFT_SERVER }} --token=${{ secrets.OPENSHIFT_TOKEN }} --insecure-skip-tls-verify=true
+          oc project ${{ env.OPENSHIFT_PROJECT }}
+
+      - name: Deploy Application
+        env:
+          FULL_IMAGE: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        run: |
+          echo "🚀 Deploy / Update ${{ env.APP_NAME }}"
+          oc get deploy ${{ env.APP_NAME }} >/dev/null 2>&1 || oc create deployment ${{ env.APP_NAME }} --image=$FULL_IMAGE
+          oc set image deploy/${{ env.APP_NAME }} ${{ env.APP_NAME }}=$FULL_IMAGE
+
+          # Create / Update Secret
+          oc delete secret email-secret --ignore-not-found
+          oc create secret generic email-secret \
+            --from-literal=EMAIL_FROM="${{ secrets.EMAIL_FROM }}" \
+            --from-literal=EMAIL_PASS="${{ secrets.EMAIL_PASS }}" \
+            --from-literal=EMAIL_TO="${{ secrets.EMAIL_TO }}"
+
+          # Inject env vars from secret
+          oc set env deploy/${{ env.APP_NAME }} --from=secret/email-secret
+
+          # Rollout
+          oc rollout restart deploy/${{ env.APP_NAME }}
+          oc rollout status deploy/${{ env.APP_NAME }}
+
+          # Service
+          oc get svc ${{ env.APP_NAME }} >/dev/null 2>&1 || oc create service clusterip ${{ env.APP_NAME }} --tcp=${{ env.APP_PORT }}:${{ env.APP_PORT }}
+
+          # Route
+          oc get route ${{ env.APP_NAME }} >/dev/null 2>&1 || oc create route edge ${{ env.APP_NAME }} \
+            --service=${{ env.APP_NAME }} \
+            --port=${{ env.APP_PORT }} \
+            --insecure-policy=Redirect
+
+          echo "✅ Deployment completed"
+          echo "🌍 Application URL:"
+          oc get route ${{ env.APP_NAME }} -o jsonpath='http://{.spec.host}'
