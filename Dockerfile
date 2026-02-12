@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+RUN touch last_signals.json && chmod 666 last_signals.json
+
 EXPOSE 8501
 
 ENV STREAMLIT_SERVER_HEADLESS=true
