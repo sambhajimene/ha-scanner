@@ -11,7 +11,7 @@ from streamlit_autorefresh import st_autorefresh
 # ================= CONFIG =================
 
 API_KEY = "z9rful06a9890v8m"
-ACCESS_TOKEN = "Rylci23jGBJE6J636yAxoZCeUct0EEiX"
+ACCESS_TOKEN = "IInPxgBD32aAoK3WdfiWXipAyXZzhjYJ"
 
 # ================== Email Config ==================
 SMTP_SERVER = "smtp.gmail.com"
