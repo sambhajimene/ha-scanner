@@ -85,7 +85,7 @@ def send_signal_alert(bullish, bearish):
         for s in bearish:
             body += f"{s}\n"
 
-    return send_email("🔥 HA Scanner Alert", body)
+    return send_email("HA Bullish & Bearish Alert", body)
 
 
 # ================= SIGNAL MEMORY =================
@@ -243,7 +243,7 @@ def scan_market():
 # ================= STREAMLIT UI =================
 
 st.set_page_config(layout="wide")
-st.title("🔥 HA Multi-Timeframe Scanner")
+st.title("HA MT Bu&Be")
 
 st.sidebar.title("⚙ Settings")
 auto_mode = st.sidebar.checkbox("Enable Auto Scan Every Hour")
