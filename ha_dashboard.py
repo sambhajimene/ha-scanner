@@ -8,8 +8,15 @@ import time
 from email.mime.text import MIMEText
 from kiteconnect import KiteConnect
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
+
+# ===== SAFE PLOTLY IMPORT =====
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except Exception:
+    PLOTLY_AVAILABLE = False
+
 
 # ================= CONFIG =================
 
@@ -34,6 +41,7 @@ SIGNAL_STORE_FILE = "last_signals.json"
 
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
+
 
 # ================= HEIKIN ASHI =================
 def calculate_heikin_ashi(df):
@@ -179,7 +187,7 @@ def scan_symbol(row):
         ema_resistance = last["high"] >= ema * 0.998 and last["close"] < ema
         failed_breakout = last["high"] > ema and last["close"] < ema
 
-        time.sleep(0.05)  # rate limit safe
+        time.sleep(0.05)
 
         if weekly_bull and daily_bull and hourly_bull and (ema_support or failed_breakdown):
             return ("bullish", symbol)
@@ -231,6 +239,10 @@ def scan_market():
 
 # ================= CHART =================
 def plot_chart(symbol):
+
+    if not PLOTLY_AVAILABLE:
+        st.warning("Plotly not installed. Run: pip install plotly")
+        return
 
     instruments = kite.instruments("NSE")
     df = pd.DataFrame(instruments)
