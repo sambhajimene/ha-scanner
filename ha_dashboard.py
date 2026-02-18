@@ -11,7 +11,7 @@ from streamlit_autorefresh import st_autorefresh
 # ================= CONFIG =================
 
 API_KEY = "z9rful06a9890v8m"
-ACCESS_TOKEN = "5Fywm7ZbZ7PuK4MVWTYSXsmtQSlwLmzy"
+ACCESS_TOKEN = "60PRJS0GYlhAs05Ki8Hx68JtvxQF79Is"
 
 # ================== Email Config ==================
 SMTP_SERVER = "smtp.gmail.com"
@@ -190,8 +190,14 @@ def scan_market():
             if len(hourly) < 20:
                 continue
 
+            # ===== ADD EMA50 =====
+            hourly["EMA50"] = hourly["close"].ewm(span=50).mean()
+
             ha_hourly = calculate_heikin_ashi(hourly)
             h = ha_hourly.iloc[-1]
+
+            ema = hourly["EMA50"].iloc[-1]
+            last_candle = hourly.iloc[-1]
 
             hourly_body = h["HA_Close"] - h["HA_Open"]
             hourly_lower_wick = min(h["HA_Open"], h["HA_Close"]) - h["HA_Low"]
@@ -206,7 +212,18 @@ def scan_market():
                 (hourly_body / hourly_range) > 0.5
             )
 
-            if hourly_strong:
+            # ===== NEW EMA CONDITIONS =====
+            ema_support = (
+                last_candle["low"] <= ema * 1.002 and
+                last_candle["close"] > ema
+            )
+
+            failed_breakdown = (
+                last_candle["low"] < ema and
+                last_candle["close"] > ema
+            )
+
+            if hourly_strong and (ema_support or failed_breakdown):
                 results.append(symbol)
 
         except:
@@ -263,5 +280,4 @@ if run_scan or auto_mode:
     save_signals(current_signals)
 
 st.markdown("---")
-st.caption("Weekly Strong + Daily (Neutral or Strong) Above EMA50 + Hourly Strong")
-
+st.caption("Weekly Strong + Daily (Neutral or Strong) Above EMA50 + Hourly Strong + EMA Support/Failed Breakdown")
