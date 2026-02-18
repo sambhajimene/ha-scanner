@@ -4,8 +4,11 @@ import datetime
 import smtplib
 import os
 import json
+import time
 from email.mime.text import MIMEText
 from kiteconnect import KiteConnect
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
 # ================= CONFIG =================
@@ -19,8 +22,8 @@ EMAIL_FROM = "sambhajimene@gmail.com"
 EMAIL_PASSWORD = "jgebigpsoeqqwrfa"
 EMAIL_TO = ["sambhajimene@gmail.com"]
 
-
 BODY_THRESHOLD = 0.2
+MAX_WORKERS = 8   # Parallel threads
 
 START_DAILY = datetime.date.today() - datetime.timedelta(days=120)
 START_WEEKLY = datetime.date.today() - datetime.timedelta(days=365)
@@ -31,7 +34,6 @@ SIGNAL_STORE_FILE = "last_signals.json"
 
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
-
 
 # ================= HEIKIN ASHI =================
 def calculate_heikin_ashi(df):
@@ -71,24 +73,24 @@ def send_email(subject, body):
         return str(e)
 
 
+def send_test_email():
+    return send_email("✅ Test Mail", "Scanner email working successfully.")
+
+
 def send_signal_alert(bullish, bearish):
 
-    body = "🔥 HA Multi-Timeframe Signals\n\n"
+    body = "🔥 HA Signals\n\n"
 
     if bullish:
-        body += "🟢 Bullish:\n"
-        for s in bullish:
-            body += f"{s}\n"
+        body += "🟢 Bullish:\n" + "\n".join(bullish) + "\n\n"
 
     if bearish:
-        body += "\n🔴 Bearish:\n"
-        for s in bearish:
-            body += f"{s}\n"
+        body += "🔴 Bearish:\n" + "\n".join(bearish)
 
-    return send_email("HA Bullish & Bearish Alert", body)
+    return send_email("🔥 HA Bu&Be Scanner Alert", body)
 
 
-# ================= SIGNAL MEMORY =================
+# ================= MEMORY =================
 def load_previous_signals():
     if os.path.exists(SIGNAL_STORE_FILE):
         with open(SIGNAL_STORE_FILE, "r") as f:
@@ -101,161 +103,191 @@ def save_signals(bullish, bearish):
         json.dump({"bullish": bullish, "bearish": bearish}, f)
 
 
-# ================= SCANNER =================
+# ================= SINGLE STOCK SCAN =================
+def scan_symbol(row):
+
+    symbol = row["tradingsymbol"]
+    token = row["instrument_token"]
+
+    try:
+
+        # DAILY
+        daily = pd.DataFrame(
+            kite.historical_data(token, START_DAILY, END_DATE, "day")
+        )
+        if len(daily) < 60:
+            return None
+
+        daily["EMA50"] = daily["close"].ewm(span=50).mean()
+        ha_daily = calculate_heikin_ashi(daily)
+        d = ha_daily.iloc[-1]
+
+        price_above = d["close"] > d["EMA50"]
+        price_below = d["close"] < d["EMA50"]
+
+        body = abs(d["HA_Close"] - d["HA_Open"])
+        rng = d["HA_High"] - d["HA_Low"]
+
+        if rng == 0:
+            return None
+
+        body_ratio = body / rng
+
+        daily_bull = (body_ratio < BODY_THRESHOLD or d["HA_Close"] > d["HA_Open"]) and price_above
+        daily_bear = (body_ratio < BODY_THRESHOLD or d["HA_Close"] < d["HA_Open"]) and price_below
+
+        # WEEKLY
+        weekly = pd.DataFrame(
+            kite.historical_data(token, START_WEEKLY, END_DATE, "week")
+        )
+        if len(weekly) < 10:
+            return None
+
+        ha_weekly = calculate_heikin_ashi(weekly)
+        w = ha_weekly.iloc[-1]
+
+        weekly_bull = w["HA_Close"] > w["HA_Open"]
+        weekly_bear = w["HA_Close"] < w["HA_Open"]
+
+        # HOURLY
+        hourly = pd.DataFrame(
+            kite.historical_data(token, START_HOURLY, END_DATE, "60minute")
+        )
+        if len(hourly) < 20:
+            return None
+
+        hourly["EMA50"] = hourly["close"].ewm(span=50).mean()
+
+        ha_hourly = calculate_heikin_ashi(hourly)
+        h = ha_hourly.iloc[-1]
+
+        ema = hourly["EMA50"].iloc[-1]
+        last = hourly.iloc[-1]
+
+        rng_h = h["HA_High"] - h["HA_Low"]
+        if rng_h == 0:
+            return None
+
+        ratio_h = abs(h["HA_Close"] - h["HA_Open"]) / rng_h
+
+        hourly_bull = h["HA_Close"] > h["HA_Open"] and ratio_h > 0.5
+        hourly_bear = h["HA_Close"] < h["HA_Open"] and ratio_h > 0.5
+
+        ema_support = last["low"] <= ema * 1.002 and last["close"] > ema
+        failed_breakdown = last["low"] < ema and last["close"] > ema
+
+        ema_resistance = last["high"] >= ema * 0.998 and last["close"] < ema
+        failed_breakout = last["high"] > ema and last["close"] < ema
+
+        time.sleep(0.05)  # rate limit safe
+
+        if weekly_bull and daily_bull and hourly_bull and (ema_support or failed_breakdown):
+            return ("bullish", symbol)
+
+        if weekly_bear and daily_bear and hourly_bear and (ema_resistance or failed_breakout):
+            return ("bearish", symbol)
+
+    except:
+        return None
+
+    return None
+
+
+# ================= PARALLEL SCAN =================
 def scan_market():
 
     instruments = kite.instruments("NSE")
-    df_instruments = pd.DataFrame(instruments)
+    df = pd.DataFrame(instruments)
 
-    nse500_symbols = pd.read_csv(
+    nse500 = pd.read_csv(
         "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
     )["Symbol"].tolist()
 
-    df_nse500 = df_instruments[
-        (df_instruments["segment"] == "NSE") &
-        (df_instruments["instrument_type"] == "EQ") &
-        (df_instruments["tradingsymbol"].isin(nse500_symbols))
+    df = df[
+        (df["segment"] == "NSE") &
+        (df["instrument_type"] == "EQ") &
+        (df["tradingsymbol"].isin(nse500))
     ]
 
     bullish = []
     bearish = []
 
-    for _, row in df_nse500.iterrows():
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-        symbol = row["tradingsymbol"]
-        token = row["instrument_token"]
+        futures = [executor.submit(scan_symbol, row)
+                   for _, row in df.iterrows()]
 
-        try:
-
-            # ================= DAILY =================
-            daily = pd.DataFrame(
-                kite.historical_data(token, START_DAILY, END_DATE, "day")
-            )
-
-            if len(daily) < 60:
-                continue
-
-            daily["EMA50"] = daily["close"].ewm(span=50).mean()
-
-            ha_daily = calculate_heikin_ashi(daily)
-            d = ha_daily.iloc[-1]
-
-            body = abs(d["HA_Close"] - d["HA_Open"])
-            full_range = d["HA_High"] - d["HA_Low"]
-
-            if full_range == 0:
-                continue
-
-            body_ratio = body / full_range
-
-            upper_wick = d["HA_High"] - max(d["HA_Open"], d["HA_Close"])
-            lower_wick = min(d["HA_Open"], d["HA_Close"]) - d["HA_Low"]
-
-            price_above = d["close"] > d["EMA50"]
-            price_below = d["close"] < d["EMA50"]
-
-            # Bullish Daily
-            daily_bull = (
-                (body_ratio < BODY_THRESHOLD or
-                 (d["HA_Close"] > d["HA_Open"] and body_ratio > 0.5))
-                and price_above
-            )
-
-            # Bearish Daily
-            daily_bear = (
-                (body_ratio < BODY_THRESHOLD or
-                 (d["HA_Close"] < d["HA_Open"] and body_ratio > 0.5))
-                and price_below
-            )
-
-            # ================= WEEKLY =================
-            weekly = pd.DataFrame(
-                kite.historical_data(token, START_WEEKLY, END_DATE, "week")
-            )
-
-            if len(weekly) < 10:
-                continue
-
-            ha_weekly = calculate_heikin_ashi(weekly)
-            w = ha_weekly.iloc[-1]
-
-            weekly_body = abs(w["HA_Close"] - w["HA_Open"])
-
-            weekly_bull = (
-                w["HA_Close"] > w["HA_Open"] and
-                (min(w["HA_Open"], w["HA_Close"]) - w["HA_Low"])
-                <= weekly_body * 0.1
-            )
-
-            weekly_bear = (
-                w["HA_Close"] < w["HA_Open"] and
-                (w["HA_High"] - max(w["HA_Open"], w["HA_Close"]))
-                <= weekly_body * 0.1
-            )
-
-            # ================= HOURLY =================
-            hourly = pd.DataFrame(
-                kite.historical_data(token, START_HOURLY, END_DATE, "60minute")
-            )
-
-            if len(hourly) < 20:
-                continue
-
-            hourly["EMA50"] = hourly["close"].ewm(span=50).mean()
-
-            ha_hourly = calculate_heikin_ashi(hourly)
-            h = ha_hourly.iloc[-1]
-
-            ema = hourly["EMA50"].iloc[-1]
-            last = hourly.iloc[-1]
-
-            hourly_range = h["HA_High"] - h["HA_Low"]
-            if hourly_range == 0:
-                continue
-
-            body_ratio_h = abs(h["HA_Close"] - h["HA_Open"]) / hourly_range
-
-            hourly_bull = h["HA_Close"] > h["HA_Open"] and body_ratio_h > 0.5
-            hourly_bear = h["HA_Close"] < h["HA_Open"] and body_ratio_h > 0.5
-
-            # EMA Logic
-            ema_support = last["low"] <= ema * 1.002 and last["close"] > ema
-            failed_breakdown = last["low"] < ema and last["close"] > ema
-
-            ema_resistance = last["high"] >= ema * 0.998 and last["close"] < ema
-            failed_breakout = last["high"] > ema and last["close"] < ema
-
-            # ================= FINAL =================
-            if weekly_bull and daily_bull:
-                if hourly_bull and (ema_support or failed_breakdown):
-                    bullish.append(symbol)
-
-            if weekly_bear and daily_bear:
-                if hourly_bear and (ema_resistance or failed_breakout):
-                    bearish.append(symbol)
-
-        except:
-            continue
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                side, sym = res
+                if side == "bullish":
+                    bullish.append(sym)
+                else:
+                    bearish.append(sym)
 
     return bullish, bearish
 
 
-# ================= STREAMLIT UI =================
+# ================= CHART =================
+def plot_chart(symbol):
+
+    instruments = kite.instruments("NSE")
+    df = pd.DataFrame(instruments)
+    token = df[df["tradingsymbol"] == symbol].iloc[0]["instrument_token"]
+
+    data = pd.DataFrame(
+        kite.historical_data(token, START_DAILY, END_DATE, "day")
+    )
+
+    data["EMA50"] = data["close"].ewm(span=50).mean()
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Candlestick(
+        x=data["date"],
+        open=data["open"],
+        high=data["high"],
+        low=data["low"],
+        close=data["close"],
+        name="Price"
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=data["date"],
+        y=data["EMA50"],
+        name="EMA50"
+    ))
+
+    fig.update_layout(height=600)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ================= UI =================
 
 st.set_page_config(layout="wide")
-st.title("HA MT Bu&Be")
+st.title("HA MT Bu&Be PRO")
 
 st.sidebar.title("⚙ Settings")
-auto_mode = st.sidebar.checkbox("Enable Auto Scan Every Hour")
+
+auto_mode = st.sidebar.checkbox("Auto Scan Hourly")
+test_mail_btn = st.sidebar.button("📧 Test Mail")
+
+if test_mail_btn:
+    result = send_test_email()
+    if result == True:
+        st.sidebar.success("Mail Sent")
+    else:
+        st.sidebar.error(result)
 
 if auto_mode:
     st_autorefresh(interval=3600000, limit=None)
 
-run_scan = st.button("🚀 Run Scan Now")
+run_scan = st.button("🚀 Run Scan")
 
 if run_scan or auto_mode:
 
-    with st.spinner("Scanning NSE500..."):
+    with st.spinner("Scanning market..."):
         bullish, bearish = scan_market()
 
     prev = load_previous_signals()
@@ -263,19 +295,28 @@ if run_scan or auto_mode:
     new_bull = list(set(bullish) - set(prev["bullish"]))
     new_bear = list(set(bearish) - set(prev["bearish"]))
 
-    st.subheader("🟢 Bullish Signals")
-    st.write(bullish)
+    col1, col2 = st.columns(2)
 
-    st.subheader("🔴 Bearish Signals")
-    st.write(bearish)
+    with col1:
+        st.subheader("🟢 Bullish")
+        st.write(bullish)
+
+    with col2:
+        st.subheader("🔴 Bearish")
+        st.write(bearish)
 
     if new_bull or new_bear:
         send_signal_alert(new_bull, new_bear)
-        st.success("📧 Email Alert Sent")
+        st.success("📧 Alert Sent")
 
     save_signals(bullish, bearish)
 
-st.markdown("---")
-st.caption(
-    "Weekly Strong Trend + Daily EMA50 Direction + Hourly EMA Pullback Confirmation"
-)
+    # Chart Section
+    st.markdown("---")
+    st.subheader("📈 Chart Viewer")
+
+    all_symbols = bullish + bearish
+
+    if all_symbols:
+        selected = st.selectbox("Select Symbol", all_symbols)
+        plot_chart(selected)
