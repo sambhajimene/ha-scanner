@@ -30,7 +30,7 @@ EMAIL_PASSWORD = "jgebigpsoeqqwrfa"
 EMAIL_TO = ["sambhajimene@gmail.com"]
 
 BODY_THRESHOLD = 0.2
-MAX_WORKERS = 8   # Parallel threads
+MAX_WORKERS = 8
 
 START_DAILY = datetime.date.today() - datetime.timedelta(days=120)
 START_WEEKLY = datetime.date.today() - datetime.timedelta(days=365)
@@ -100,9 +100,19 @@ def send_signal_alert(bullish, bearish):
 
 # ================= MEMORY =================
 def load_previous_signals():
+
     if os.path.exists(SIGNAL_STORE_FILE):
-        with open(SIGNAL_STORE_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(SIGNAL_STORE_FILE, "r") as f:
+                data = json.load(f)
+
+            # ensure correct format
+            if isinstance(data, dict) and "bullish" in data and "bearish" in data:
+                return data
+
+        except:
+            pass
+
     return {"bullish": [], "bearish": []}
 
 
