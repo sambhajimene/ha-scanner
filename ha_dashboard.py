@@ -182,129 +182,183 @@ def _check_weekly_signal(ha_weekly_row):
 
 def historical_backtest_symbol(token, symbol, bt_start, bt_end, hold_days):
     """
-    For a single stock:
-    1. Fetch enough historical daily + weekly bars (extra warmup for EMA50 + HA)
-    2. Walk forward bar-by-bar from bt_start to bt_end
-    3. On each bar, check if the HA daily+weekly signal fires
-    4. Record entry (next bar open) and returns at each hold horizon
-    5. Avoid duplicate signals — skip if same-direction signal already open
+    CORRECT BACKTEST LOGIC:
+    ─────────────────────────────────────────────────────────────
+    SIGNAL  : Daily HA + Weekly HA agree (same as live scanner)
+    ENTRY   : Signal candle ke baad PEHLA hourly HA candle ka OPEN
+    EXIT    : Hourly HA bars walk karo bar-by-bar:
+                Bullish  → exit jab hourly HA_Close < Hourly EMA50
+                Bearish  → exit jab hourly HA_Close > Hourly EMA50
+    ─────────────────────────────────────────────────────────────
     """
     try:
-        # Need 60 extra days warmup for EMA50 + HA calculation
-        warmup_start = bt_start - datetime.timedelta(days=200)
+        # ── Fetch data ────────────────────────────────────────────────────
 
-        daily = pd.DataFrame(kite.historical_data(token, warmup_start, bt_end, "day"))
-        if len(daily) < 70:
+        warmup_days  = 200   # EMA50 needs 50 bars warmup + buffer
+        warmup_start = bt_start - datetime.timedelta(days=warmup_days)
+        hourly_start = bt_start - datetime.timedelta(days=15)  # small warmup for hourly EMA50
+
+        # Daily bars (signal detection)
+        daily_raw = fetch_with_retry(token, warmup_start, bt_end, "day")
+        if daily_raw.empty or len(daily_raw) < 70:
             return []
 
-        weekly_start = bt_start - datetime.timedelta(days=400)
-        weekly = pd.DataFrame(kite.historical_data(token, weekly_start, bt_end, "week"))
-        if len(weekly) < 15:
+        # Weekly bars (trend confirmation)
+        weekly_raw = fetch_with_retry(token, bt_start - datetime.timedelta(days=400), bt_end, "week")
+        if weekly_raw.empty or len(weekly_raw) < 15:
             return []
 
-        # Prepare daily
-        daily["date"]  = pd.to_datetime(daily["date"]).dt.date
-        daily["EMA50"] = daily["close"].ewm(span=50).mean()
-        ha_daily       = calculate_heikin_ashi(daily)
-        ha_daily["date"]  = daily["date"].values
-        ha_daily["close"] = daily["close"].values
-        ha_daily["open"]  = daily["open"].values
-        ha_daily["EMA50"] = daily["EMA50"].values
+        # Hourly bars (entry + exit timing)
+        # Fetch from bt_start - 15 days so EMA50 is warmed up by bt_start
+        hourly_raw = fetch_with_retry(token, hourly_start, bt_end, "60minute")
+        if hourly_raw.empty or len(hourly_raw) < 20:
+            return []
 
-        # Prepare weekly — build a date→weekly_signal lookup
-        weekly["date"] = pd.to_datetime(weekly["date"]).dt.date
-        ha_weekly      = calculate_heikin_ashi(weekly)
-        ha_weekly["date"] = weekly["date"].values
+        # ── Prepare DAILY ─────────────────────────────────────────────────
+        daily_raw["date"]  = pd.to_datetime(daily_raw["date"]).dt.date
+        daily_raw["EMA50"] = daily_raw["close"].ewm(span=50).mean()
+        ha_daily           = calculate_heikin_ashi(daily_raw)
+        ha_daily["date"]   = daily_raw["date"].values
+        ha_daily["EMA50"]  = daily_raw["EMA50"].values
+        ha_daily           = ha_daily.reset_index(drop=True)
 
-        # Build a daily-date → most recent weekly HA signal map
-        # Weekly bar date = week start; we map forward to all days in that week
-        weekly_signal_by_date = {}
-        for i, wrow in ha_weekly.iterrows():
-            sig = _check_weekly_signal(wrow)
-            weekly_signal_by_date[wrow["date"]] = sig
+        # ── Prepare WEEKLY signal lookup ──────────────────────────────────
+        weekly_raw["date"] = pd.to_datetime(weekly_raw["date"]).dt.date
+        ha_weekly          = calculate_heikin_ashi(weekly_raw)
+        ha_weekly["date"]  = weekly_raw["date"].values
 
-        def get_weekly_signal_for_date(d):
-            # find the most recent weekly bar date <= d
-            candidates = [k for k in weekly_signal_by_date if k <= d]
-            if not candidates:
-                return None
-            return weekly_signal_by_date[max(candidates)]
+        weekly_sig_map = {}
+        for _, wrow in ha_weekly.iterrows():
+            weekly_sig_map[wrow["date"]] = _check_weekly_signal(wrow)
 
-        # Walk forward through daily bars in backtest window
+        def get_weekly_sig(d):
+            candidates = [k for k in weekly_sig_map if k <= d]
+            return weekly_sig_map[max(candidates)] if candidates else None
+
+        # ── Prepare HOURLY ────────────────────────────────────────────────
+        hourly_raw["datetime"] = pd.to_datetime(hourly_raw["date"])
+        hourly_raw["date"]     = hourly_raw["datetime"].dt.date
+        hourly_raw["EMA50"]    = hourly_raw["close"].ewm(span=50).mean()
+        ha_hourly              = calculate_heikin_ashi(hourly_raw)
+        ha_hourly["datetime"]  = hourly_raw["datetime"].values
+        ha_hourly["date"]      = hourly_raw["date"].values
+        ha_hourly["EMA50"]     = hourly_raw["EMA50"].values
+        ha_hourly              = ha_hourly.reset_index(drop=True)
+
+        # Build date → list of hourly bar indices  (for fast lookup)
+        date_to_hourly_idx = {}
+        for idx, row in ha_hourly.iterrows():
+            d = row["date"]
+            date_to_hourly_idx.setdefault(d, []).append(idx)
+
+        # ── Walk forward daily bars (signal detection) ────────────────────
         signals_found = []
-        last_signal   = None   # prevent consecutive same-direction signals
+        last_signal   = None  # cooldown: skip consecutive same-direction signals
 
-        bt_start_dt = bt_start
-        bt_end_dt   = bt_end
-
-        for i, row in ha_daily.iterrows():
-            bar_date = row["date"]
-            if bar_date < bt_start_dt or bar_date > bt_end_dt:
+        for i, drow in ha_daily.iterrows():
+            bar_date = drow["date"]
+            if bar_date < bt_start or bar_date > bt_end:
                 continue
-            if i + 1 >= len(ha_daily):
-                continue  # need next bar for entry price
 
-            daily_sig  = _check_daily_signal(row, row["EMA50"])
-            weekly_sig = get_weekly_signal_for_date(bar_date)
+            # Check daily + weekly agreement
+            daily_sig  = _check_daily_signal(drow, drow["EMA50"])
+            weekly_sig = get_weekly_sig(bar_date)
 
-            # Both must agree
-            if daily_sig is None or weekly_sig is None:
-                last_signal = None
-                continue
-            if daily_sig != weekly_sig:
+            if daily_sig is None or weekly_sig is None or daily_sig != weekly_sig:
                 last_signal = None
                 continue
 
             signal = daily_sig
-
-            # Avoid repeating same signal back-to-back (cooldown)
             if signal == last_signal:
+                continue   # cooldown
+
+            # ── Find first hourly bar AFTER this daily signal candle ──────
+            # Signal candle closes at end of bar_date.
+            # Entry = OPEN of first hourly candle on the NEXT trading date.
+
+            # Get all hourly bar indices after bar_date
+            future_hourly = [
+                idx for d, idxs in date_to_hourly_idx.items()
+                if d > bar_date
+                for idx in idxs
+            ]
+            if not future_hourly:
                 continue
 
-            # Entry = next bar's open (realistic — can't trade on same bar's close)
-            next_bar    = ha_daily.iloc[i + 1]
-            entry_price = next_bar["open"]
-            entry_date  = next_bar["date"]
+            first_hourly_idx = min(future_hourly)  # earliest bar after signal
+            first_hourly_bar = ha_hourly.iloc[first_hourly_idx]
+
+            entry_price    = float(first_hourly_bar["open"])
+            entry_datetime = first_hourly_bar["datetime"]
+            entry_date     = first_hourly_bar["date"]
+
             if entry_price == 0:
                 continue
 
-            result = {
-                "signal_date": str(bar_date),
-                "entry_date":  str(entry_date),
-                "symbol":      symbol,
-                "signal":      signal,
-                "entry_price": round(entry_price, 2),
-            }
+            # ── Walk hourly bars to find EXIT ─────────────────────────────
+            # Bullish  → exit when hourly HA_Close crosses BELOW EMA50
+            # Bearish  → exit when hourly HA_Close crosses ABOVE EMA50
+            exit_price    = None
+            exit_datetime = None
+            exit_bars     = 0   # how many hourly bars held
+            max_gain_pct  = 0.0
+            max_loss_pct  = 0.0
 
-            # Calculate returns at each hold horizon
-            for d in hold_days:
-                exit_idx = i + 1 + d
-                if exit_idx < len(ha_daily):
-                    exit_price = ha_daily.iloc[exit_idx]["close"]
-                    mult       = 1 if signal == "bullish" else -1
-                    pct        = mult * (exit_price - entry_price) / entry_price * 100
-                    result[f"return_{d}d"] = round(pct, 2)
-                    result[f"exit_{d}d"]   = round(exit_price, 2)
-                else:
-                    result[f"return_{d}d"] = None
-                    result[f"exit_{d}d"]   = None
+            for j in range(first_hourly_idx + 1, len(ha_hourly)):
+                hbar      = ha_hourly.iloc[j]
+                ha_close  = float(hbar["HA_Close"])
+                ema_val   = float(hbar["EMA50"])
+                bar_close = float(hbar["close"])
+                exit_bars += 1
 
-            # Max gain / max loss over the longest hold window
-            max_d    = max(hold_days)
-            end_idx  = min(i + 1 + max_d, len(ha_daily))
-            future   = ha_daily.iloc[i + 1:end_idx]["close"]
-            if len(future) > 0:
+                # Track max gain / max loss (using actual close, not HA)
+                pct_now = (bar_close - entry_price) / entry_price * 100
                 if signal == "bullish":
-                    result["max_gain"] = round((future.max() - entry_price) / entry_price * 100, 2)
-                    result["max_loss"] = round((future.min() - entry_price) / entry_price * 100, 2)
+                    max_gain_pct = max(max_gain_pct,  pct_now)
+                    max_loss_pct = min(max_loss_pct,  pct_now)
                 else:
-                    result["max_gain"] = round((entry_price - future.min()) / entry_price * 100, 2)
-                    result["max_loss"] = round((entry_price - future.max()) / entry_price * 100, 2)
-            else:
-                result["max_gain"] = None
-                result["max_loss"] = None
+                    max_gain_pct = max(max_gain_pct, -pct_now)
+                    max_loss_pct = min(max_loss_pct, -pct_now)
 
-            signals_found.append(result)
+                # Exit condition
+                exit_triggered = (
+                    (signal == "bullish" and ha_close < ema_val) or
+                    (signal == "bearish" and ha_close > ema_val)
+                )
+
+                if exit_triggered:
+                    exit_price    = bar_close  # exit at actual close of exit bar
+                    exit_datetime = hbar["datetime"]
+                    break
+
+            # If no exit found before data ends → mark as open trade
+            if exit_price is None:
+                last_hourly      = ha_hourly.iloc[-1]
+                exit_price       = float(last_hourly["close"])
+                exit_datetime    = last_hourly["datetime"]
+                trade_still_open = True
+            else:
+                trade_still_open = False
+
+            # ── Calculate P&L ─────────────────────────────────────────────
+            mult       = 1 if signal == "bullish" else -1
+            return_pct = mult * (exit_price - entry_price) / entry_price * 100
+
+            signals_found.append({
+                "signal_date":    str(bar_date),
+                "entry_datetime": str(entry_datetime),
+                "exit_datetime":  str(exit_datetime),
+                "symbol":         symbol,
+                "signal":         signal,
+                "entry_price":    round(entry_price, 2),
+                "exit_price":     round(exit_price, 2),
+                "return_%":       round(return_pct, 2),
+                "max_gain_%":     round(max_gain_pct, 2),
+                "max_loss_%":     round(max_loss_pct, 2),
+                "hold_hours":     exit_bars,
+                "trade_open":     trade_still_open,  # True = no exit signal yet
+            })
+
             last_signal = signal
 
         return signals_found
@@ -313,9 +367,9 @@ def historical_backtest_symbol(token, symbol, bt_start, bt_end, hold_days):
         return []
 
 
-def run_historical_backtest(instrument_df, bt_start, bt_end, hold_days,
+def run_historical_backtest(instrument_df, bt_start, bt_end,
                              progress_bar=None, status_text=None):
-    """Run historical backtest across all Nifty500 stocks in parallel."""
+    """Run historical backtest across all stocks in parallel."""
     token_map = dict(zip(instrument_df["tradingsymbol"], instrument_df["instrument_token"]))
     all_rows  = []
     total     = len(instrument_df)
@@ -327,7 +381,8 @@ def run_historical_backtest(instrument_df, bt_start, bt_end, hold_days,
                 historical_backtest_symbol,
                 token_map[row["tradingsymbol"]],
                 row["tradingsymbol"],
-                bt_start, bt_end, hold_days
+                bt_start, bt_end,
+                (5, 10, 20)
             ): row["tradingsymbol"]
             for _, row in instrument_df.iterrows()
             if row["tradingsymbol"] in token_map
@@ -341,10 +396,9 @@ def run_historical_backtest(instrument_df, bt_start, bt_end, hold_days,
             if progress_bar:
                 progress_bar.progress(done / total)
             if status_text:
-                sym = futures[f]
                 status_text.info(
-                    f"Backtesting `{done}/{total}` stocks… "
-                    f"· {len(all_rows)} signals found so far"
+                    f"Backtesting `{done}/{total}` stocks · "
+                    f"{len(all_rows)} signals found"
                 )
 
     if not all_rows:
@@ -356,209 +410,190 @@ def run_historical_backtest(instrument_df, bt_start, bt_end, hold_days,
 
 
 # ================= BACKTEST RESULTS UI =================
-def render_backtest_results(bt_df, hold_days):
-    """Shared UI to display backtest results — used by both tabs."""
+def render_backtest_results(bt_df):
+    """
+    Display backtest results.
+    Columns expected:
+      signal_date, entry_datetime, exit_datetime, symbol, signal,
+      entry_price, exit_price, return_%, max_gain_%, max_loss_%,
+      hold_hours, trade_open
+    """
     if bt_df.empty:
         st.warning("No signals found in this period. Try a wider date range or relax filters.")
         return
 
-    return_cols = [f"return_{d}d" for d in hold_days if f"return_{d}d" in bt_df.columns]
+    ret_col = "return_%"
 
     # ── Summary metrics ───────────────────────────────────────────────────
-    st.subheader("📈 Performance Summary")
-    summary_rows = []
-    for d in hold_days:
-        col = f"return_{d}d"
-        if col not in bt_df.columns:
-            continue
-        series   = bt_df[col].dropna()
-        wins     = (series > 0).sum()
-        total    = len(series)
-        win_rate = wins / total * 100 if total > 0 else 0
-        summary_rows.append({
-            "Hold Period":  f"{d} days",
-            "# Signals":    total,
-            "Win Rate %":   round(win_rate, 1),
-            "Avg Return %": round(series.mean(), 2),
-            "Median %":     round(series.median(), 2),
-            "Best %":       round(series.max(), 2),
-            "Worst %":      round(series.min(), 2),
-            "Std Dev %":    round(series.std(), 2),
-        })
+    closed  = bt_df[~bt_df["trade_open"]] if "trade_open" in bt_df.columns else bt_df
+    open_tr = bt_df[bt_df["trade_open"]]  if "trade_open" in bt_df.columns else pd.DataFrame()
 
-    if summary_rows:
-        sdf = pd.DataFrame(summary_rows)
-        def color_val(val):
-            if isinstance(val, (int, float)):
-                return f"color: {'green' if val > 0 else ('red' if val < 0 else 'gray')}"
-            return ""
-        st.dataframe(
-            sdf.style.applymap(color_val, subset=["Avg Return %", "Median %", "Best %", "Worst %"]),
-            use_container_width=True
-        )
-
-    # Signal direction breakdown
     bull_bt = bt_df[bt_df["signal"] == "bullish"]
     bear_bt = bt_df[bt_df["signal"] == "bearish"]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📋 Total Signals", len(bt_df))
-    m2.metric("🟢 Bullish",       len(bull_bt))
-    m3.metric("🔴 Bearish",       len(bear_bt))
-    primary_col = f"return_{hold_days[0]}d"
-    if primary_col in bt_df.columns:
-        overall_wr = (bt_df[primary_col].dropna() > 0).mean() * 100
-        m4.metric(f"🎯 Win Rate ({hold_days[0]}d)", f"{overall_wr:.1f}%")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("📋 Total Signals",  len(bt_df))
+    m2.metric("🟢 Bullish",        len(bull_bt))
+    m3.metric("🔴 Bearish",        len(bear_bt))
+    m4.metric("✅ Closed Trades",  len(closed))
+    m5.metric("⏳ Still Open",     len(open_tr))
+
+    if ret_col in closed.columns and len(closed) > 0:
+        series   = closed[ret_col].dropna()
+        wins     = (series > 0).sum()
+        win_rate = wins / len(series) * 100 if len(series) > 0 else 0
+
+        st.divider()
+        st.subheader("📈 Performance Summary (Closed Trades Only)")
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Win Rate",   f"{win_rate:.1f}%")
+        s2.metric("Avg Return", f"{series.mean():.2f}%")
+        s3.metric("Median",     f"{series.median():.2f}%")
+        s4.metric("Best Trade", f"{series.max():.2f}%")
+        s5.metric("Worst Trade",f"{series.min():.2f}%")
+        s6.metric("Avg Hold",   f"{closed['hold_hours'].mean():.0f}h" if "hold_hours" in closed.columns else "N/A")
+
+        # Bull vs Bear breakdown
+        for side, sub, color in [("Bullish", bull_bt, "🟢"), ("Bearish", bear_bt, "🔴")]:
+            sub_closed = sub[~sub["trade_open"]] if "trade_open" in sub.columns else sub
+            if len(sub_closed) == 0:
+                continue
+            s = sub_closed[ret_col].dropna()
+            wr = (s > 0).mean() * 100
+            st.caption(
+                f"{color} {side}: {len(sub_closed)} trades · "
+                f"Win Rate {wr:.1f}% · Avg {s.mean():.2f}% · "
+                f"Best {s.max():.2f}% · Worst {s.min():.2f}%"
+            )
 
     # ── Charts ────────────────────────────────────────────────────────────
-    if PLOTLY_AVAILABLE and return_cols:
+    if PLOTLY_AVAILABLE and ret_col in closed.columns and len(closed) > 0:
         st.divider()
         tab_eq, tab_dist, tab_heatmap, tab_sym = st.tabs([
             "📈 Equity Curve", "📊 Distribution", "🗓 Monthly Heatmap", "🏆 By Symbol"
         ])
 
-        primary_col = f"return_{hold_days[0]}d"
-        primary_d   = hold_days[0]
-
-        # Equity curve
         with tab_eq:
-            if primary_col in bt_df.columns:
-                eq = bt_df[["signal_date", "signal", primary_col]].dropna().sort_values("signal_date")
-
-                fig = go.Figure()
-                for sig, color in [("bullish", "limegreen"), ("bearish", "tomato")]:
-                    sub = eq[eq["signal"] == sig].copy()
-                    sub["cumret"] = sub[primary_col].cumsum()
-                    fig.add_trace(go.Scatter(
-                        x=sub["signal_date"], y=sub["cumret"],
-                        name=sig.capitalize(), mode="lines",
-                        line=dict(color=color, width=2)
-                    ))
-
-                all_eq = eq.copy()
-                all_eq["cumret"] = all_eq[primary_col].cumsum()
+            eq = closed[["signal_date", "signal", ret_col]].dropna().sort_values("signal_date")
+            fig = go.Figure()
+            for sig, color in [("bullish", "limegreen"), ("bearish", "tomato")]:
+                sub = eq[eq["signal"] == sig].copy()
+                if sub.empty: continue
+                sub["cumret"] = sub[ret_col].cumsum()
                 fig.add_trace(go.Scatter(
-                    x=all_eq["signal_date"], y=all_eq["cumret"],
-                    name="Combined", mode="lines",
-                    line=dict(color="royalblue", width=2, dash="dot")
+                    x=sub["signal_date"], y=sub["cumret"],
+                    name=sig.capitalize(), mode="lines+markers",
+                    line=dict(color=color, width=2),
+                    marker=dict(size=4)
                 ))
+            all_eq = eq.copy()
+            all_eq["cumret"] = all_eq[ret_col].cumsum()
+            fig.add_trace(go.Scatter(
+                x=all_eq["signal_date"], y=all_eq["cumret"],
+                name="Combined", mode="lines",
+                line=dict(color="royalblue", width=2, dash="dot")
+            ))
+            fig.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig.update_layout(
+                title="Cumulative Returns (Exit = Hourly HA crosses EMA50)",
+                xaxis_title="Signal Date", yaxis_title="Cumulative Return %",
+                height=420, template="plotly_dark"
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-                fig.add_hline(y=0, line_dash="dash", line_color="gray")
-                fig.update_layout(
-                    title=f"Cumulative Returns — {primary_d}-day hold",
-                    xaxis_title="Signal Date", yaxis_title="Cumulative Return %",
-                    height=420, template="plotly_dark"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-        # Distribution
         with tab_dist:
-            ncols = len(hold_days)
-            fig2  = make_subplots(rows=1, cols=ncols,
-                                   subplot_titles=[f"{d}-day hold" for d in hold_days])
-            for i, d in enumerate(hold_days, 1):
-                col = f"return_{d}d"
-                if col not in bt_df.columns:
-                    continue
-                vals   = bt_df[col].dropna()
-                colors = ["green" if v > 0 else "red" for v in vals]
-                fig2.add_trace(go.Histogram(
-                    x=vals, name=f"{d}d",
-                    marker_color=colors, nbinsx=40, opacity=0.75
-                ), row=1, col=i)
-                fig2.add_vline(x=0, line_dash="dash", line_color="white",
-                               row=1, col=i)
+            vals   = closed[ret_col].dropna()
+            colors = ["green" if v > 0 else "red" for v in vals]
+            fig2   = go.Figure()
+            fig2.add_trace(go.Histogram(
+                x=vals, marker_color=colors, nbinsx=40, opacity=0.8,
+                name="Return %"
+            ))
+            fig2.add_vline(x=0, line_dash="dash", line_color="white")
+            fig2.add_vline(x=vals.mean(), line_dash="dot", line_color="yellow",
+                           annotation_text=f"Avg {vals.mean():.2f}%")
             fig2.update_layout(
-                title="Return Distribution", height=400,
-                template="plotly_dark", showlegend=False
+                title="Return % Distribution (Closed Trades)",
+                xaxis_title="Return %", height=400, template="plotly_dark"
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-        # Monthly heatmap
         with tab_heatmap:
-            if primary_col in bt_df.columns:
-                hm = bt_df[["signal_date", "signal", primary_col]].dropna().copy()
-                hm["month"] = pd.to_datetime(hm["signal_date"]).dt.to_period("M").astype(str)
-                hm["win"]   = (hm[primary_col] > 0).astype(int)
-                pivot = hm.pivot_table(
-                    index="signal", columns="month",
-                    values="win", aggfunc="mean"
-                ) * 100
+            hm = closed[["signal_date", "signal", ret_col]].dropna().copy()
+            hm["month"] = pd.to_datetime(hm["signal_date"]).dt.to_period("M").astype(str)
+            hm["win"]   = (hm[ret_col] > 0).astype(int)
+            pivot = hm.pivot_table(index="signal", columns="month",
+                                    values="win", aggfunc="mean") * 100
+            if not pivot.empty:
+                fig3 = go.Figure(go.Heatmap(
+                    z=pivot.values,
+                    x=pivot.columns.tolist(),
+                    y=[s.capitalize() for s in pivot.index.tolist()],
+                    colorscale="RdYlGn", zmin=0, zmax=100,
+                    text=pivot.values.round(0), texttemplate="%{text}%",
+                    colorbar=dict(title="Win Rate %")
+                ))
+                fig3.update_layout(title="Monthly Win Rate Heatmap",
+                                    height=300, template="plotly_dark")
+                st.plotly_chart(fig3, use_container_width=True)
 
-                if not pivot.empty:
-                    fig3 = go.Figure(go.Heatmap(
-                        z=pivot.values,
-                        x=pivot.columns.tolist(),
-                        y=[s.capitalize() for s in pivot.index.tolist()],
-                        colorscale="RdYlGn", zmin=0, zmax=100,
-                        text=pivot.values.round(0),
-                        texttemplate="%{text}%",
-                        colorbar=dict(title="Win Rate %")
-                    ))
-                    fig3.update_layout(
-                        title=f"Monthly Win Rate ({primary_d}-day hold)",
-                        height=300, template="plotly_dark"
-                    )
-                    st.plotly_chart(fig3, use_container_width=True)
-
-        # By symbol
         with tab_sym:
-            if primary_col in bt_df.columns:
-                sym_stats = (
-                    bt_df.groupby("symbol")[primary_col]
-                    .agg(Signals="count", WinRate=lambda x: (x > 0).mean() * 100,
-                         AvgReturn="mean")
-                    .round(2)
-                    .sort_values("AvgReturn", ascending=False)
-                    .reset_index()
-                )
-                sym_stats.columns = ["Symbol", "Signals", "Win Rate %", "Avg Return %"]
-                top20  = sym_stats.head(20)
-                bot20  = sym_stats.tail(20)
-                c_sym1, c_sym2 = st.columns(2)
-                with c_sym1:
-                    st.markdown("#### 🏆 Top 20 Symbols")
-                    st.dataframe(top20, use_container_width=True)
-                with c_sym2:
-                    st.markdown("#### 💀 Bottom 20 Symbols")
-                    st.dataframe(bot20, use_container_width=True)
+            sym_stats = (
+                closed.groupby("symbol")[ret_col]
+                .agg(Trades="count",
+                     WinRate=lambda x: round((x > 0).mean() * 100, 1),
+                     AvgReturn=lambda x: round(x.mean(), 2),
+                     Best=lambda x: round(x.max(), 2),
+                     Worst=lambda x: round(x.min(), 2))
+                .sort_values("AvgReturn", ascending=False)
+                .reset_index()
+            )
+            sym_stats.columns = ["Symbol", "Trades", "Win Rate %", "Avg Return %", "Best %", "Worst %"]
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("#### 🏆 Top 20 Symbols")
+                st.dataframe(sym_stats.head(20), use_container_width=True)
+            with c2:
+                st.markdown("#### 💀 Bottom 20 Symbols")
+                st.dataframe(sym_stats.tail(20), use_container_width=True)
 
-    # ── Detailed trades table ─────────────────────────────────────────────
+    # ── All trades table ──────────────────────────────────────────────────
     st.divider()
     st.subheader("📋 All Trades")
-    display_cols = (["signal_date", "entry_date", "symbol", "signal", "entry_price",
-                      "max_gain", "max_loss"] + return_cols)
-    display_cols = [c for c in display_cols if c in bt_df.columns]
+    disp_cols = ["signal_date", "entry_datetime", "exit_datetime",
+                  "symbol", "signal", "entry_price", "exit_price",
+                  "return_%", "max_gain_%", "max_loss_%", "hold_hours", "trade_open"]
+    disp_cols = [c for c in disp_cols if c in bt_df.columns]
 
     def color_cell(val):
         if isinstance(val, (int, float)):
             return f"color: {'green' if val > 0 else 'red'}"
         return ""
 
-    styled_bt = bt_df[display_cols].style.applymap(
-        color_cell, subset=[c for c in return_cols + ["max_gain", "max_loss"]
-                            if c in bt_df.columns]
-    )
-    st.dataframe(styled_bt, use_container_width=True)
+    color_subset = [c for c in ["return_%", "max_gain_%", "max_loss_%"] if c in bt_df.columns]
+    styled = bt_df[disp_cols].style.applymap(color_cell, subset=color_subset)
+    st.dataframe(styled, use_container_width=True)
 
     csv = bt_df.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", csv, "backtest_results.csv", "text/csv")
 
-    # ── Top / bottom trades ───────────────────────────────────────────────
-    st.divider()
-    primary_col = f"return_{hold_days[0]}d"
-    if primary_col in bt_df.columns:
-        sorted_bt = bt_df.dropna(subset=[primary_col]).sort_values(primary_col, ascending=False)
+    # ── Top / Bottom trades ───────────────────────────────────────────────
+    if ret_col in closed.columns and len(closed) > 0:
+        st.divider()
+        sorted_bt = closed.sort_values(ret_col, ascending=False)
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("#### 🏆 Top 10 Trades")
             st.dataframe(
-                sorted_bt.head(10)[["signal_date", "symbol", "signal", primary_col, "max_gain"]],
+                sorted_bt.head(10)[["signal_date","symbol","signal",
+                                     "entry_price","exit_price","return_%","hold_hours"]],
                 use_container_width=True
             )
         with c2:
             st.markdown("#### 💀 Bottom 10 Trades")
             st.dataframe(
-                sorted_bt.tail(10)[["signal_date", "symbol", "signal", primary_col, "max_loss"]],
+                sorted_bt.tail(10)[["signal_date","symbol","signal",
+                                     "entry_price","exit_price","return_%","hold_hours"]],
                 use_container_width=True
             )
 
@@ -1019,7 +1054,7 @@ with tab_historical_bt:
         st.error("Instrument data not loaded. Check API connection.")
     else:
         # ── Controls ──────────────────────────────────────────────────────
-        bc1, bc2, bc3 = st.columns(3)
+        bc1, bc2 = st.columns(2)
         with bc1:
             bt_period = st.selectbox(
                 "Backtest period",
@@ -1027,12 +1062,6 @@ with tab_historical_bt:
                 index=0
             )
         with bc2:
-            hold_days_sel = st.multiselect(
-                "Hold horizons (days)",
-                options=[3, 5, 10, 15, 20, 30],
-                default=[5, 10, 20]
-            )
-        with bc3:
             filter_sig_bt = st.selectbox("Signal type", ["All", "Bullish only", "Bearish only"])
 
         # Date range
@@ -1051,57 +1080,43 @@ with tab_historical_bt:
                                        max_value=TODAY - datetime.timedelta(days=1))
             bt_end   = dc2.date_input("To",   value=TODAY, max_value=TODAY)
 
-        st.caption(f"📅 Backtest window: **{bt_start}** → **{bt_end}** "
-                   f"({(bt_end - bt_start).days} calendar days)")
+        st.caption(
+            f"\U0001f4c5 Backtest window: **{bt_start}** \u2192 **{bt_end}** "
+            f"({(bt_end - bt_start).days} calendar days) | "
+            f"Entry = next hourly HA open | Exit = hourly HA close crosses EMA50"
+        )
 
-        if not hold_days_sel:
-            st.warning("Select at least one hold horizon.")
-        else:
-            hold_days_tuple = tuple(sorted(hold_days_sel))
+        with st.expander("\U0001f50e Filter to specific symbols (optional)"):
+            all_syms     = sorted(instrument_df["tradingsymbol"].tolist())
+            selected_sym = st.multiselect("Leave empty to scan all Nifty 500", all_syms)
 
-            # Optional: filter to specific symbols
-            with st.expander("🔎 Filter to specific symbols (optional)"):
-                all_syms     = sorted(instrument_df["tradingsymbol"].tolist())
-                selected_sym = st.multiselect("Leave empty to scan all Nifty 500", all_syms)
+        run_bt = st.button("\u25b6\ufe0f Run Historical Backtest", type="primary")
 
-            run_bt = st.button("▶️ Run Historical Backtest", type="primary")
+        if run_bt:
+            bt_instr = instrument_df.copy()
+            if selected_sym:
+                bt_instr = bt_instr[bt_instr["tradingsymbol"].isin(selected_sym)]
 
-            if run_bt:
-                bt_instr = instrument_df.copy()
-                if selected_sym:
-                    bt_instr = bt_instr[bt_instr["tradingsymbol"].isin(selected_sym)]
+            n_stocks = len(bt_instr)
+            st.info(f"Running backtest on **{n_stocks} stocks** | window **{bt_start} \u2192 {bt_end}**")
 
-                n_stocks = len(bt_instr)
-                st.info(
-                    f"Running backtest on **{n_stocks} stocks** · "
-                    f"window **{bt_start} → {bt_end}** · "
-                    f"hold horizons: {hold_days_tuple}"
-                )
+            bt_progress = st.progress(0)
+            bt_status   = st.empty()
 
-                bt_progress = st.progress(0)
-                bt_status   = st.empty()
+            start_bt = time.time()
+            bt_df = run_historical_backtest(bt_instr, bt_start, bt_end, bt_progress, bt_status)
+            elapsed_bt = time.time() - start_bt
 
-                start_bt = time.time()
-                bt_df = run_historical_backtest(
-                    bt_instr, bt_start, bt_end,
-                    hold_days_tuple, bt_progress, bt_status
-                )
-                elapsed_bt = time.time() - start_bt
+            bt_progress.progress(1.0)
+            bt_status.success(f"\u2705 Done in {elapsed_bt:.1f}s \u2014 {len(bt_df)} signals found across {n_stocks} stocks")
 
-                bt_progress.progress(1.0)
-                bt_status.success(
-                    f"✅ Done in {elapsed_bt:.1f}s — "
-                    f"{len(bt_df)} signals found across {n_stocks} stocks"
-                )
+            if filter_sig_bt == "Bullish only":
+                bt_df = bt_df[bt_df["signal"] == "bullish"]
+            elif filter_sig_bt == "Bearish only":
+                bt_df = bt_df[bt_df["signal"] == "bearish"]
 
-                # Apply signal filter
-                if filter_sig_bt == "Bullish only":
-                    bt_df = bt_df[bt_df["signal"] == "bullish"]
-                elif filter_sig_bt == "Bearish only":
-                    bt_df = bt_df[bt_df["signal"] == "bearish"]
-
-                st.divider()
-                render_backtest_results(bt_df, hold_days_tuple)
+            st.divider()
+            render_backtest_results(bt_df)
 
 
 # ═══════════════════════════════════════════════════════════
