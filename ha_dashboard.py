@@ -32,6 +32,7 @@ EMAIL_TO       = ["sambhajimene@gmail.com"]
 MAX_WORKERS         = 8      # Keep low — Zerodha rate limit ~3 req/sec, 3 calls/stock
 MIN_VOLUME          = 100_000
 RETRY_DELAY         = 1.5    # seconds to wait on rate limit before retry
+EMA_NEAR_PCT        = 0.03   # Daily HA close must be within 3% of EMA50 ("near EMA")
 
 TODAY        = datetime.date.today()
 START_DAILY  = TODAY - datetime.timedelta(days=120)
@@ -705,20 +706,25 @@ def scan_symbol(row, debug_mode=False):
         d_strong_bear = is_strong_bear_ha(d)
         d_neutral     = is_neutral_ha(d)
 
-        # EMA condition — HA Close vs EMA50
+        # EMA condition:
+        # BULLISH → HA Close above EMA50 AND within EMA_NEAR_PCT of EMA50
+        # BEARISH → HA Close below EMA50 AND within EMA_NEAR_PCT of EMA50
         d_above_ema = d["HA_Close"] > ema50_d
         d_below_ema = d["HA_Close"] < ema50_d
+        d_near_ema  = abs(d["HA_Close"] - ema50_d) / ema50_d <= EMA_NEAR_PCT
 
-        daily_bull_ok = (d_strong_bull or d_neutral) and d_above_ema
-        daily_bear_ok = (d_strong_bear or d_neutral) and d_below_ema
+        daily_bull_ok = (d_strong_bull or d_neutral) and d_above_ema and d_near_ema
+        daily_bear_ok = (d_strong_bear or d_neutral) and d_below_ema and d_near_ema
 
         if debug_mode:
+            pct_dist = abs(d["HA_Close"] - ema50_d) / ema50_d * 100
             log.append(
                 f"{symbol} | DAILY HA → "
                 f"open={d['HA_Open']:.2f}  low={d['HA_Low']:.2f}  "
                 f"high={d['HA_High']:.2f}  close={d['HA_Close']:.2f}  ema50={ema50_d:.2f} | "
-                f"strong_bull={d_strong_bull}  strong_bear={d_strong_bear}  neutral={d_neutral} | "
-                f"above_ema={d_above_ema}  below_ema={d_below_ema} | "
+                f"dist_from_ema={pct_dist:.2f}% (limit={EMA_NEAR_PCT*100:.0f}%) | "
+                f"strong_bull={d_strong_bull}  neutral={d_neutral}  strong_bear={d_strong_bear} | "
+                f"above={d_above_ema}  below={d_below_ema}  near={d_near_ema} | "
                 f"daily_bull_ok={daily_bull_ok}  daily_bear_ok={daily_bear_ok}"
             )
 
@@ -876,16 +882,24 @@ with st.sidebar:
     MAX_WORKERS = st.number_input("Parallel Workers",  value=MAX_WORKERS, step=1,
                                    min_value=1, max_value=15,
                                    help="Keep ≤ 10 to avoid Zerodha rate limit errors")
+    EMA_NEAR_PCT = st.slider(
+        "Daily: max % distance from EMA50",
+        min_value=1, max_value=10, value=int(EMA_NEAR_PCT * 100), step=1,
+        help="Daily HA close must be within this % of EMA50 to qualify as 'near EMA'. Default = 3%"
+    ) / 100.0
+
+    st.divider()
     debug_mode  = st.checkbox("🐛 Debug Mode", value=False)
     auto_mode   = st.checkbox("🔄 Auto Scan (hourly)", value=False)
     st.divider()
     st.markdown("**📐 Active Conditions**")
     st.caption("🟢 **Bullish**")
-    st.caption("Weekly: HA open=low, close>open")
-    st.caption("Daily: (strong OR neutral) + close>EMA50")
-    st.caption("Hourly: HA open=low, close>open + near/fake EMA50 + RSI 40–60")
+    st.caption("Weekly HA: open = low, close > open")
+    st.caption("Daily HA: (strong OR neutral) + close > EMA50 + within {:.0f}% of EMA50".format(EMA_NEAR_PCT * 100))
+    st.caption("Hourly HA: open = low, close > open + near/fake EMA50 + RSI 40–60")
+    st.caption("🔴 **Bearish** = mirror opposite")
     st.divider()
-    st.caption(f"Workers: {MAX_WORKERS} · Min Vol: {MIN_VOLUME:,}")
+    st.caption(f"Workers: {MAX_WORKERS} · Min Vol: {MIN_VOLUME:,} · EMA±{EMA_NEAR_PCT*100:.0f}%")
 
 if auto_mode:
     st_autorefresh(interval=3_600_000, limit=None)
