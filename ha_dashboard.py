@@ -21,7 +21,7 @@ except:
 # ================= CONFIG =================
 
 API_KEY = "z9rful06a9890v8m"
-ACCESS_TOKEN = "60PRJS0GYlhAs05Ki8Hx68JtvxQF79Is"
+ACCESS_TOKEN = "3d6BWxuk9IuP4fvIAo3q06IE4EGavzCs"
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
