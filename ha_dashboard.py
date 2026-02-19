@@ -29,9 +29,9 @@ EMAIL_FROM     = "sambhajimene@gmail.com"
 EMAIL_PASSWORD = "jgebigpsoeqqwrfa"
 EMAIL_TO       = ["sambhajimene@gmail.com"]
 
-BODY_THRESHOLD = 0.2
-MAX_WORKERS    = 30
-MIN_VOLUME     = 100_000
+MAX_WORKERS         = 8      # Keep low — Zerodha rate limit ~3 req/sec, 3 calls/stock
+MIN_VOLUME          = 100_000
+RETRY_DELAY         = 1.5    # seconds to wait on rate limit before retry
 
 TODAY        = datetime.date.today()
 START_DAILY  = TODAY - datetime.timedelta(days=120)
@@ -146,51 +146,35 @@ def save_signals(bullish, bearish):
 # using the daily close vs daily EMA50.
 # =================================================================
 
-def _check_daily_signal(ha_row, ema50_val, close_val, body_threshold=0.2):
+def _check_daily_signal(ha_row, ema50_val):
     """
-    Apply daily HA signal logic to a single bar.
-    Returns 'bullish', 'bearish', or None.
+    Daily HA signal — exact same logic as live scanner.
+    BULLISH: (strong bull OR neutral) AND HA_Close > EMA50
+    BEARISH: (strong bear OR neutral) AND HA_Close < EMA50
     """
-    d = ha_row
-    body       = abs(d["HA_Close"] - d["HA_Open"])
-    full_range = d["HA_High"] - d["HA_Low"]
-    if full_range == 0:
-        return None
+    strong_bull = is_strong_bull_ha(ha_row)
+    strong_bear = is_strong_bear_ha(ha_row)
+    neutral     = is_neutral_ha(ha_row)
 
-    body_ratio  = body / full_range
-    upper_wick  = d["HA_High"] - max(d["HA_Open"], d["HA_Close"])
-    lower_wick  = min(d["HA_Open"], d["HA_Close"]) - d["HA_Low"]
-    price_above = close_val > ema50_val
-    price_below = close_val < ema50_val
+    above_ema = ha_row["HA_Close"] > ema50_val
+    below_ema = ha_row["HA_Close"] < ema50_val
 
-    daily_neutral_bull = (body_ratio < body_threshold and upper_wick > 0
-                          and lower_wick > 0 and price_above)
-    daily_strong_bull  = (d["HA_Close"] > d["HA_Open"]
-                          and lower_wick <= body * 0.1
-                          and body_ratio > 0.5 and price_above)
-    daily_neutral_bear = (body_ratio < body_threshold and upper_wick > 0
-                          and lower_wick > 0 and price_below)
-    daily_strong_bear  = (d["HA_Close"] < d["HA_Open"]
-                          and upper_wick <= body * 0.1
-                          and body_ratio > 0.5 and price_below)
-
-    if daily_neutral_bull or daily_strong_bull:
+    if (strong_bull or neutral) and above_ema:
         return "bullish"
-    if daily_neutral_bear or daily_strong_bear:
+    if (strong_bear or neutral) and below_ema:
         return "bearish"
     return None
 
 
 def _check_weekly_signal(ha_weekly_row):
-    """Apply weekly HA signal logic."""
-    w            = ha_weekly_row
-    weekly_body  = w["HA_Close"] - w["HA_Open"]
-    weekly_upper = w["HA_High"] - max(w["HA_Open"], w["HA_Close"])
-    weekly_lower = min(w["HA_Open"], w["HA_Close"]) - w["HA_Low"]
-
-    if weekly_body > 0 and weekly_lower <= weekly_body * 0.1:
+    """
+    Weekly HA signal — exact same logic as live scanner.
+    BULLISH: HA Open == HA Low AND HA Close > HA Open
+    BEARISH: HA Open == HA High AND HA Close < HA Open
+    """
+    if is_strong_bull_ha(ha_weekly_row):
         return "bullish"
-    if weekly_body < 0 and weekly_upper <= abs(weekly_body) * 0.1:
+    if is_strong_bear_ha(ha_weekly_row):
         return "bearish"
     return None
 
@@ -259,7 +243,7 @@ def historical_backtest_symbol(token, symbol, bt_start, bt_end, hold_days):
             if i + 1 >= len(ha_daily):
                 continue  # need next bar for entry price
 
-            daily_sig  = _check_daily_signal(row, row["EMA50"], row["close"])
+            daily_sig  = _check_daily_signal(row, row["EMA50"])
             weekly_sig = get_weekly_signal_for_date(bar_date)
 
             # Both must agree
@@ -600,101 +584,226 @@ def pre_filter_by_volume(df, status_text):
 
 
 # ================= SINGLE STOCK LIVE SCAN =================
+def fetch_with_retry(token, from_date, to_date, interval, retries=3):
+    """Fetch historical data with automatic retry on rate limit errors."""
+    for attempt in range(retries):
+        try:
+            data = kite.historical_data(token, from_date, to_date, interval)
+            return pd.DataFrame(data)
+        except Exception as e:
+            err = str(e).lower()
+            if "too many requests" in err or "rate" in err or "429" in err:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+            else:
+                raise e
+    return pd.DataFrame()
+
+
+def calculate_rsi(series, period=14):
+    """Standard RSI using EWM (Wilder's method)."""
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+
+def is_strong_bull_ha(ha_row, tol=0.001):
+    """
+    Strong Bullish HA candle:
+      - HA Open == HA Low  (no lower wick at all)
+      - HA Close > HA Open (green candle)
+    tol: relative tolerance for float equality (0.1%)
+    """
+    open_eq_low = abs(ha_row["HA_Open"] - ha_row["HA_Low"]) <= abs(ha_row["HA_Open"]) * tol
+    return open_eq_low and (ha_row["HA_Close"] > ha_row["HA_Open"])
+
+
+def is_strong_bear_ha(ha_row, tol=0.001):
+    """
+    Strong Bearish HA candle:
+      - HA Open == HA High (no upper wick at all)
+      - HA Close < HA Open (red candle)
+    """
+    open_eq_high = abs(ha_row["HA_Open"] - ha_row["HA_High"]) <= abs(ha_row["HA_Open"]) * tol
+    return open_eq_high and (ha_row["HA_Close"] < ha_row["HA_Open"])
+
+
+def is_neutral_ha(ha_row):
+    """
+    Neutral HA candle:
+      - Both upper wick AND lower wick exist
+      - Body can be any size (no restriction)
+    """
+    upper_wick = ha_row["HA_High"] - max(ha_row["HA_Open"], ha_row["HA_Close"])
+    lower_wick = min(ha_row["HA_Open"], ha_row["HA_Close"]) - ha_row["HA_Low"]
+    return upper_wick > 0 and lower_wick > 0
+
+
 def scan_symbol(row, debug_mode=False):
     symbol = row["tradingsymbol"]
     token  = row["instrument_token"]
     log    = []
+
     try:
-        daily = pd.DataFrame(kite.historical_data(token, START_DAILY, END_DATE, "day"))
-        if len(daily) < 60:
-            return None, f"{symbol}: insufficient daily data ({len(daily)} bars)"
-        daily["EMA50"] = daily["close"].ewm(span=50).mean()
-        ha_daily       = calculate_heikin_ashi(daily)
-        d              = ha_daily.iloc[-1]
 
-        body       = abs(d["HA_Close"] - d["HA_Open"])
-        full_range = d["HA_High"] - d["HA_Low"]
-        if full_range == 0:
-            return None, f"{symbol}: zero daily range"
-
-        body_ratio  = body / full_range
-        upper_wick  = d["HA_High"] - max(d["HA_Open"], d["HA_Close"])
-        lower_wick  = min(d["HA_Open"], d["HA_Close"]) - d["HA_Low"]
-        price_above = d["close"] > d["EMA50"]
-        price_below = d["close"] < d["EMA50"]
-
-        daily_neutral_bull = (body_ratio < BODY_THRESHOLD and upper_wick > 0
-                              and lower_wick > 0 and price_above)
-        daily_strong_bull  = (d["HA_Close"] > d["HA_Open"]
-                              and lower_wick <= body * 0.1
-                              and body_ratio > 0.5 and price_above)
-        daily_neutral_bear = (body_ratio < BODY_THRESHOLD and upper_wick > 0
-                              and lower_wick > 0 and price_below)
-        daily_strong_bear  = (d["HA_Close"] < d["HA_Open"]
-                              and upper_wick <= body * 0.1
-                              and body_ratio > 0.5 and price_below)
-
-        daily_bull_ok = daily_neutral_bull or daily_strong_bull
-        daily_bear_ok = daily_neutral_bear or daily_strong_bear
-
-        if debug_mode:
-            log.append(f"{symbol} | Daily: body_ratio={body_ratio:.2f}, price_above={price_above}, "
-                       f"neutral_bull={daily_neutral_bull}, strong_bull={daily_strong_bull}, "
-                       f"neutral_bear={daily_neutral_bear}, strong_bear={daily_strong_bear}")
-
-        if not (daily_bull_ok or daily_bear_ok):
-            return None, "\n".join(log) if log else f"{symbol}: failed daily"
-
-        weekly = pd.DataFrame(kite.historical_data(token, START_WEEKLY, END_DATE, "week"))
-        if len(weekly) < 10:
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 1 — WEEKLY HA
+        #
+        # BULLISH: HA Open == HA Low  AND  HA Close > HA Open
+        # BEARISH: HA Open == HA High AND  HA Close < HA Open
+        # ══════════════════════════════════════════════════════════════════
+        weekly    = fetch_with_retry(token, START_WEEKLY, END_DATE, "week")
+        if weekly.empty or len(weekly) < 10:
             return None, f"{symbol}: insufficient weekly data"
-        ha_weekly    = calculate_heikin_ashi(weekly)
-        w            = ha_weekly.iloc[-1]
-        weekly_body  = w["HA_Close"] - w["HA_Open"]
-        weekly_upper = w["HA_High"] - max(w["HA_Open"], w["HA_Close"])
-        weekly_lower = min(w["HA_Open"], w["HA_Close"]) - w["HA_Low"]
-        weekly_bull  = weekly_body > 0 and weekly_lower <= weekly_body * 0.1
-        weekly_bear  = weekly_body < 0 and weekly_upper <= abs(weekly_body) * 0.1
+
+        ha_weekly = calculate_heikin_ashi(weekly)
+        w         = ha_weekly.iloc[-1]
+
+        weekly_bull = is_strong_bull_ha(w)
+        weekly_bear = is_strong_bear_ha(w)
 
         if debug_mode:
-            log.append(f"{symbol} | Weekly: body={weekly_body:.2f}, bull={weekly_bull}, bear={weekly_bear}")
+            log.append(
+                f"{symbol} | WEEKLY HA → "
+                f"open={w['HA_Open']:.2f}  low={w['HA_Low']:.2f}  "
+                f"high={w['HA_High']:.2f}  close={w['HA_Close']:.2f} | "
+                f"strong_bull={weekly_bull}  strong_bear={weekly_bear}"
+            )
 
         if not (weekly_bull or weekly_bear):
-            return None, "\n".join(log) if log else f"{symbol}: failed weekly"
+            return None, "\n".join(log) if log else f"{symbol}: WEEKLY failed — HA open≠low/high"
 
-        hourly = pd.DataFrame(kite.historical_data(token, START_HOURLY, END_DATE, "60minute"))
-        if len(hourly) < 20:
-            return None, f"{symbol}: insufficient hourly data"
-        hourly["EMA50"] = hourly["close"].ewm(span=50).mean()
-        ha_hourly       = calculate_heikin_ashi(hourly)
-        h               = ha_hourly.iloc[-1]
-        ema             = hourly["EMA50"].iloc[-1]
-        last            = hourly.iloc[-1]
-        body_h          = abs(h["HA_Close"] - h["HA_Open"])
-        range_h         = h["HA_High"] - h["HA_Low"]
-        if range_h == 0:
-            return None, f"{symbol}: zero hourly range"
-        ratio_h          = body_h / range_h
-        hourly_bull      = h["HA_Close"] > h["HA_Open"] and ratio_h > 0.5
-        hourly_bear      = h["HA_Close"] < h["HA_Open"] and ratio_h > 0.5
-        ema_support      = last["low"]  <= ema * 1.002 and last["close"] > ema
-        failed_breakdown = last["low"]  <  ema         and last["close"] > ema
-        ema_resistance   = last["high"] >= ema * 0.998 and last["close"] < ema
-        failed_breakout  = last["high"] >  ema         and last["close"] < ema
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 2 — DAILY HA
+        #
+        # BULLISH condition (both must pass):
+        #   Candle:  strong bull (open==low, close>open)
+        #         OR neutral    (both wicks exist, any body size)
+        #   EMA:     HA candle (close) is ABOVE EMA50
+        #
+        # BEARISH condition (both must pass):
+        #   Candle:  strong bear (open==high, close<open)
+        #         OR neutral    (both wicks exist, any body size)
+        #   EMA:     HA candle (close) is BELOW EMA50
+        # ══════════════════════════════════════════════════════════════════
+        daily    = fetch_with_retry(token, START_DAILY, END_DATE, "day")
+        if daily.empty or len(daily) < 60:
+            return None, f"{symbol}: insufficient daily data"
+
+        daily["EMA50"] = daily["close"].ewm(span=50).mean()
+        ha_daily       = calculate_heikin_ashi(daily)
+
+        # Merge EMA50 into HA frame (same index)
+        ha_daily["EMA50"] = daily["EMA50"].values
+
+        d          = ha_daily.iloc[-1]
+        ema50_d    = d["EMA50"]
+
+        # Candle type
+        d_strong_bull = is_strong_bull_ha(d)
+        d_strong_bear = is_strong_bear_ha(d)
+        d_neutral     = is_neutral_ha(d)
+
+        # EMA condition — HA Close vs EMA50
+        d_above_ema = d["HA_Close"] > ema50_d
+        d_below_ema = d["HA_Close"] < ema50_d
+
+        daily_bull_ok = (d_strong_bull or d_neutral) and d_above_ema
+        daily_bear_ok = (d_strong_bear or d_neutral) and d_below_ema
 
         if debug_mode:
-            log.append(f"{symbol} | Hourly: ratio={ratio_h:.2f}, bull={hourly_bull}, bear={hourly_bear}, "
-                       f"ema_support={ema_support}, failed_breakdown={failed_breakdown}")
+            log.append(
+                f"{symbol} | DAILY HA → "
+                f"open={d['HA_Open']:.2f}  low={d['HA_Low']:.2f}  "
+                f"high={d['HA_High']:.2f}  close={d['HA_Close']:.2f}  ema50={ema50_d:.2f} | "
+                f"strong_bull={d_strong_bull}  strong_bear={d_strong_bear}  neutral={d_neutral} | "
+                f"above_ema={d_above_ema}  below_ema={d_below_ema} | "
+                f"daily_bull_ok={daily_bull_ok}  daily_bear_ok={daily_bear_ok}"
+            )
 
-        if weekly_bull and daily_bull_ok and hourly_bull and (ema_support or failed_breakdown):
+        if not (daily_bull_ok or daily_bear_ok):
+            return None, "\n".join(log) if log else f"{symbol}: DAILY failed"
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 3 — HOURLY HA
+        #
+        # THREE conditions — ALL must pass:
+        #
+        # 1. SIGNAL CANDLE
+        #    BULLISH: HA Open == HA Low AND HA Close > HA Open  (strong bull)
+        #    BEARISH: HA Open == HA High AND HA Close < HA Open (strong bear)
+        #
+        # 2. EMA50 INTERACTION  (price near EMA or fake break)
+        #    BULLISH: price near EMA50 (within 0.5% above)
+        #          OR fake breakdown (hourly low dipped below EMA but close > EMA)
+        #    BEARISH: price near EMA50 (within 0.5% below)
+        #          OR fake breakout  (hourly high spiked above EMA but close < EMA)
+        #
+        # 3. RSI(14) between 40 and 60  (not overbought, not oversold)
+        # ══════════════════════════════════════════════════════════════════
+        hourly    = fetch_with_retry(token, START_HOURLY, END_DATE, "60minute")
+        if hourly.empty or len(hourly) < 20:
+            return None, f"{symbol}: insufficient hourly data"
+
+        hourly["EMA50"] = hourly["close"].ewm(span=50).mean()
+        hourly["RSI"]   = calculate_rsi(hourly["close"], period=14)
+        ha_hourly       = calculate_heikin_ashi(hourly)
+        ha_hourly["EMA50"] = hourly["EMA50"].values
+        ha_hourly["RSI"]   = hourly["RSI"].values
+
+        # Use last COMPLETED hourly bar
+        h      = ha_hourly.iloc[-1]
+        last_h = hourly.iloc[-1]   # raw bar for low/high EMA interaction
+        ema_h  = h["EMA50"]
+        rsi_h  = h["RSI"]
+
+        # ── Condition 1: Signal candle ────────────────────────────────
+        h_strong_bull = is_strong_bull_ha(h)
+        h_strong_bear = is_strong_bear_ha(h)
+
+        # ── Condition 2: EMA interaction ──────────────────────────────
+        # BULLISH
+        near_ema_bull  = (0 < (h["HA_Close"] - ema_h) / ema_h <= 0.005)   # close within 0.5% above EMA
+        fake_breakdown = (last_h["low"] < ema_h) and (last_h["close"] > ema_h)
+        ema_bull_ok    = near_ema_bull or fake_breakdown
+
+        # BEARISH
+        near_ema_bear  = (0 < (ema_h - h["HA_Close"]) / ema_h <= 0.005)   # close within 0.5% below EMA
+        fake_breakout  = (last_h["high"] > ema_h) and (last_h["close"] < ema_h)
+        ema_bear_ok    = near_ema_bear or fake_breakout
+
+        # ── Condition 3: RSI 40–60 ────────────────────────────────────
+        rsi_ok = 40 <= rsi_h <= 60
+
+        if debug_mode:
+            log.append(
+                f"{symbol} | HOURLY HA → "
+                f"open={h['HA_Open']:.2f}  low={h['HA_Low']:.2f}  "
+                f"high={h['HA_High']:.2f}  close={h['HA_Close']:.2f}  "
+                f"ema50={ema_h:.2f}  rsi={rsi_h:.1f} | "
+                f"strong_bull={h_strong_bull}  strong_bear={h_strong_bear} | "
+                f"near_ema_bull={near_ema_bull}  fake_breakdown={fake_breakdown}  ema_bull_ok={ema_bull_ok} | "
+                f"near_ema_bear={near_ema_bear}  fake_breakout={fake_breakout}  ema_bear_ok={ema_bear_ok} | "
+                f"rsi_ok(40≤{rsi_h:.1f}≤60)={rsi_ok}"
+            )
+
+        # ── FINAL SIGNAL ──────────────────────────────────────────────
+        #
+        # BULLISH = weekly_bull AND daily_bull_ok AND h_strong_bull AND ema_bull_ok AND rsi_ok
+        # BEARISH = weekly_bear AND daily_bear_ok AND h_strong_bear AND ema_bear_ok AND rsi_ok
+        #
+        if weekly_bull and daily_bull_ok and h_strong_bull and ema_bull_ok and rsi_ok:
             log.append(f"✅ {symbol} → BULLISH")
             return ("bullish", symbol), "\n".join(log)
-        if weekly_bear and daily_bear_ok and hourly_bear and (ema_resistance or failed_breakout):
+
+        if weekly_bear and daily_bear_ok and h_strong_bear and ema_bear_ok and rsi_ok:
             log.append(f"✅ {symbol} → BEARISH")
             return ("bearish", symbol), "\n".join(log)
 
-        log.append(f"{symbol}: passed daily+weekly but FAILED final check")
+        log.append(f"{symbol}: passed weekly+daily but FAILED hourly check")
         return None, "\n".join(log)
+
     except Exception as e:
         return None, f"{symbol}: ERROR — {e}"
 
@@ -763,10 +872,18 @@ st.divider()
 # ── Sidebar ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
-    MIN_VOLUME  = st.number_input("Min Volume Filter", value=MIN_VOLUME,  step=50_000, min_value=0)
-    MAX_WORKERS = st.number_input("Parallel Workers",  value=MAX_WORKERS, step=5, min_value=1, max_value=50)
+    MIN_VOLUME  = st.number_input("Min Volume Filter", value=MIN_VOLUME, step=50_000, min_value=0)
+    MAX_WORKERS = st.number_input("Parallel Workers",  value=MAX_WORKERS, step=1,
+                                   min_value=1, max_value=15,
+                                   help="Keep ≤ 10 to avoid Zerodha rate limit errors")
     debug_mode  = st.checkbox("🐛 Debug Mode", value=False)
     auto_mode   = st.checkbox("🔄 Auto Scan (hourly)", value=False)
+    st.divider()
+    st.markdown("**📐 Active Conditions**")
+    st.caption("🟢 **Bullish**")
+    st.caption("Weekly: HA open=low, close>open")
+    st.caption("Daily: (strong OR neutral) + close>EMA50")
+    st.caption("Hourly: HA open=low, close>open + near/fake EMA50 + RSI 40–60")
     st.divider()
     st.caption(f"Workers: {MAX_WORKERS} · Min Vol: {MIN_VOLUME:,}")
 
