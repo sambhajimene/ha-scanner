@@ -2,6 +2,13 @@ FROM python:3.11
 
 WORKDIR /app
 
+# ✅ Install timezone data
+RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+
+# ✅ Set Indian Timezone
+ENV TZ=Asia/Kolkata
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 COPY requirements.txt .
 
 RUN python -m pip install --upgrade pip
