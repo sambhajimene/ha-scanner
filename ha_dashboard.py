@@ -21,6 +21,7 @@ EMAIL_PASSWORD = "jgebigpsoeqqwrfa"
 EMAIL_TO = ["sambhajimene@gmail.com"]
 
 BODY_THRESHOLD = 0.2
+SLEEP_INTERVAL = 0.2
 
 START_DAILY = datetime.date.today() - datetime.timedelta(days=120)
 START_WEEKLY = datetime.date.today() - datetime.timedelta(days=365)
@@ -28,6 +29,8 @@ START_HOURLY = datetime.date.today() - datetime.timedelta(days=10)
 END_DATE = datetime.date.today()
 
 SIGNAL_STORE_FILE = "last_signals.json"
+
+# ==========================================
 
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
@@ -47,6 +50,7 @@ def calculate_heikin_ashi(df):
     ha["HA_Low"] = ha[["low", "HA_Open", "HA_Close"]].min(axis=1)
 
     return ha
+# =================================================
 
 
 # ================= EMAIL =================
@@ -66,12 +70,20 @@ def send_email(subject, body):
         return str(e)
 
 
-def send_signal_alert(symbols, signal_type="Bullish"):
-    body = f"🔥 New {signal_type} HA Multi-Timeframe Signals:\n\n"
+def send_test_email():
+    return send_email(
+        "✅ HA Scanner Test Email",
+        "Your HA Scanner email configuration is working properly."
+    )
+
+
+def send_signal_alert(symbols):
+    body = "🔥 New HA Multi-Timeframe Signals Found:\n\n"
     for s in symbols:
         body += f"{s}\n"
 
-    return send_email(f"🔥 {signal_type} HA Scanner Alert", body)
+    return send_email("🔥 HA Scanner Alert", body)
+# =================================================
 
 
 # ================= SIGNAL MEMORY =================
@@ -79,12 +91,13 @@ def load_previous_signals():
     if os.path.exists(SIGNAL_STORE_FILE):
         with open(SIGNAL_STORE_FILE, "r") as f:
             return json.load(f)
-    return {"bullish": [], "bearish": []}
+    return []
 
 
-def save_signals(bullish, bearish):
+def save_signals(signals):
     with open(SIGNAL_STORE_FILE, "w") as f:
-        json.dump({"bullish": bullish, "bearish": bearish}, f)
+        json.dump(signals, f)
+# =================================================
 
 
 # ================= SCANNER =================
@@ -103,8 +116,7 @@ def scan_market():
         (df_instruments["tradingsymbol"].isin(nse500_symbols))
     ]
 
-    bullish_results = []
-    bearish_results = []
+    results = []
 
     for _, row in df_nse500.iterrows():
 
@@ -131,37 +143,24 @@ def scan_market():
             body_ratio = body / full_range
             upper_wick = d["HA_High"] - max(d["HA_Open"], d["HA_Close"])
             lower_wick = min(d["HA_Open"], d["HA_Close"]) - d["HA_Low"]
-
             price_above_ema = d["close"] > d["EMA50"]
-            price_below_ema = d["close"] < d["EMA50"]
 
-            daily_neutral_bull = (
+            daily_neutral = (
                 body_ratio < BODY_THRESHOLD and
                 upper_wick > 0 and
                 lower_wick > 0 and
                 price_above_ema
             )
 
-            daily_strong_bull = (
+            daily_strong = (
                 d["HA_Close"] > d["HA_Open"] and
                 lower_wick <= (body * 0.1) and
                 body_ratio > 0.5 and
                 price_above_ema
             )
 
-            daily_neutral_bear = (
-                body_ratio < BODY_THRESHOLD and
-                upper_wick > 0 and
-                lower_wick > 0 and
-                price_below_ema
-            )
-
-            daily_strong_bear = (
-                d["HA_Close"] < d["HA_Open"] and
-                upper_wick <= (body * 0.1) and
-                body_ratio > 0.5 and
-                price_below_ema
-            )
+            if not (daily_neutral or daily_strong):
+                continue
 
             # ================= WEEKLY =================
             weekly = pd.DataFrame(
@@ -174,18 +173,15 @@ def scan_market():
             w = ha_weekly.iloc[-1]
 
             weekly_body = w["HA_Close"] - w["HA_Open"]
-            weekly_upper_wick = w["HA_High"] - max(w["HA_Open"], w["HA_Close"])
             weekly_lower_wick = min(w["HA_Open"], w["HA_Close"]) - w["HA_Low"]
 
-            weekly_strong_bull = (
+            weekly_strong = (
                 weekly_body > 0 and
                 weekly_lower_wick <= (weekly_body * 0.1)
             )
 
-            weekly_strong_bear = (
-                weekly_body < 0 and
-                weekly_upper_wick <= (abs(weekly_body) * 0.1)
-            )
+            if not weekly_strong:
+                continue
 
             # ================= HOURLY =================
             hourly = pd.DataFrame(
@@ -194,108 +190,94 @@ def scan_market():
             if len(hourly) < 20:
                 continue
 
+            # ===== ADD EMA50 =====
             hourly["EMA50"] = hourly["close"].ewm(span=50).mean()
 
             ha_hourly = calculate_heikin_ashi(hourly)
             h = ha_hourly.iloc[-1]
 
             ema = hourly["EMA50"].iloc[-1]
-            last = hourly.iloc[-1]
+            last_candle = hourly.iloc[-1]
 
             hourly_body = h["HA_Close"] - h["HA_Open"]
-            hourly_range = h["HA_High"] - h["HA_Low"]
             hourly_lower_wick = min(h["HA_Open"], h["HA_Close"]) - h["HA_Low"]
-            hourly_upper_wick = h["HA_High"] - max(h["HA_Open"], h["HA_Close"])
+            hourly_range = h["HA_High"] - h["HA_Low"]
 
             if hourly_range == 0:
                 continue
 
-            # ===== Bullish =====
-            hourly_strong_bull = (
+            hourly_strong = (
                 hourly_body > 0 and
                 hourly_lower_wick <= (hourly_body * 0.1) and
                 (hourly_body / hourly_range) > 0.5
             )
 
+            # ===== NEW EMA CONDITIONS =====
             ema_support = (
-                last["low"] <= ema * 1.002 and
-                last["close"] > ema
+                last_candle["low"] <= ema * 1.002 and
+                last_candle["close"] > ema
             )
 
             failed_breakdown = (
-                last["low"] < ema and
-                last["close"] > ema
+                last_candle["low"] < ema and
+                last_candle["close"] > ema
             )
 
-            # ===== Bearish =====
-            hourly_strong_bear = (
-                hourly_body < 0 and
-                hourly_upper_wick <= (abs(hourly_body) * 0.1) and
-                (abs(hourly_body) / hourly_range) > 0.5
-            )
-
-            ema_resistance = (
-                last["high"] >= ema * 0.998 and
-                last["close"] < ema
-            )
-
-            failed_breakout = (
-                last["high"] > ema and
-                last["close"] < ema
-            )
-
-            # ===== Final Conditions =====
-
-            if weekly_strong_bull and (daily_neutral_bull or daily_strong_bull) and hourly_strong_bull and (ema_support or failed_breakdown):
-                bullish_results.append(symbol)
-
-            if weekly_strong_bear and (daily_neutral_bear or daily_strong_bear) and hourly_strong_bear and (ema_resistance or failed_breakout):
-                bearish_results.append(symbol)
+            if hourly_strong and (ema_support or failed_breakdown):
+                results.append(symbol)
 
         except:
             continue
 
-    return bullish_results, bearish_results
+    return results
+# =================================================
 
 
 # ================= STREAMLIT UI =================
 
 st.set_page_config(layout="wide")
-st.title("🔥 HA Scanner (Bullish + Bearish)")
+st.title("🔥 HA Scanner")
 
+st.sidebar.title("⚙ Settings")
 auto_mode = st.sidebar.checkbox("Enable Auto Scan Every Hour")
 
 if auto_mode:
     st_autorefresh(interval=3600000, limit=None, key="refresh")
 
-run_scan = st.button("🚀 Run Scan Now")
+col1, col2 = st.columns(2)
+
+run_scan = col1.button("🚀 Run Scan Now")
+test_mail = col2.button("📧 Send Test Mail")
+
+if test_mail:
+    result = send_test_email()
+    if result == True:
+        st.success("Test Email Sent Successfully!")
+    else:
+        st.error(result)
 
 if run_scan or auto_mode:
 
     with st.spinner("Scanning NSE500... Please wait..."):
-        bullish, bearish = scan_market()
+        current_signals = scan_market()
 
-    prev = load_previous_signals()
+    previous_signals = load_previous_signals()
+    new_signals = list(set(current_signals) - set(previous_signals))
 
-    new_bull = list(set(bullish) - set(prev["bullish"]))
-    new_bear = list(set(bearish) - set(prev["bearish"]))
+    if current_signals:
+        st.success(f"Found {len(current_signals)} Signals")
+        st.write(current_signals)
+    else:
+        st.warning("No setups found.")
 
-    col1, col2 = st.columns(2)
+    if new_signals:
+        email_status = send_signal_alert(new_signals)
+        if email_status == True:
+            st.success(f"📬 Email Alert Sent for {len(new_signals)} New Signals")
+        else:
+            st.error(email_status)
 
-    with col1:
-        st.subheader("🟢 Bullish Signals")
-        st.write(bullish)
+    save_signals(current_signals)
 
-    with col2:
-        st.subheader("🔴 Bearish Signals")
-        st.write(bearish)
-
-    if new_bull:
-        send_signal_alert(new_bull, "Bullish")
-
-    if new_bear:
-        send_signal_alert(new_bear, "Bearish")
-
-    save_signals(bullish, bearish)
-
-st.caption("Weekly Strong + Daily EMA Trend + Hourly Strong + EMA Reaction")
+st.markdown("---")
+st.caption("Weekly Strong + Daily (Neutral or Strong) Above EMA50 + Hourly Strong + EMA Support/Failed Breakdown")
