@@ -1,4 +1,3 @@
-##
 FROM python:3.11
 
 WORKDIR /app
@@ -10,7 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN touch last_signals.json && chmod 666 last_signals.json
+# Create JSON with write permissions
+RUN touch /app/live_ha_signals.json && chmod 666 /app/live_ha_signals.json
 
 EXPOSE 8501
 
