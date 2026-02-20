@@ -87,16 +87,43 @@ def send_signal_alert(symbols):
 
 
 # ================= SIGNAL MEMORY =================
-def load_previous_signals():
-    if os.path.exists(SIGNAL_STORE_FILE):
-        with open(SIGNAL_STORE_FILE, "r") as f:
-            return json.load(f)
-    return []
+import json
+import os
 
+SIGNAL_STORE_FILE = "last_signals.json"  # or previous_signals.json
+
+DEFAULT_SIGNALS = {
+    "bullish": [],
+    "bearish": []
+}
+
+def load_previous_signals():
+    if not os.path.exists(SIGNAL_STORE_FILE) or os.path.getsize(SIGNAL_STORE_FILE) == 0:
+        return DEFAULT_SIGNALS.copy()
+    
+    try:
+        with open(SIGNAL_STORE_FILE, "r") as f:
+            data = json.load(f)
+            # Ensure it's a dict with correct keys
+            if not isinstance(data, dict):
+                return DEFAULT_SIGNALS.copy()
+            if "bullish" not in data:
+                data["bullish"] = []
+            if "bearish" not in data:
+                data["bearish"] = []
+            return data
+    except json.JSONDecodeError:
+        # If JSON is corrupted, return default
+        return DEFAULT_SIGNALS.copy()
 
 def save_signals(signals):
+    # Ensure signals always have the correct keys
+    signals_to_save = {
+        "bullish": signals.get("bullish", []),
+        "bearish": signals.get("bearish", [])
+    }
     with open(SIGNAL_STORE_FILE, "w") as f:
-        json.dump(signals, f)
+        json.dump(signals_to_save, f, indent=4)
 # =================================================
 
 
