@@ -1,310 +1,174 @@
-import streamlit as st
-import pandas as pd
-import datetime
-import smtplib
-import os
-import json
-from email.mime.text import MIMEText
+# ============================================
+# LIVE NSE 500 HA Scanner — KiteConnect + Streamlit
+# Multi‑Timeframe (Weekly, Daily, Hourly)
+# EMA 50 Rising, RSI 40–60 / Cross, ADX, HA Logic
+# Support/Resistance & Fake Break Entry
+# ============================================
+
+import kiteconnect
 from kiteconnect import KiteConnect
-from streamlit_autorefresh import st_autorefresh
-
-# ================= CONFIG =================
-
-API_KEY = "z9rful06a9890v8m"
-ACCESS_TOKEN = "X78rnH2NAuTJvEfblvtVShawi4ygf2W9"
-
-# ================== Email Config ==================
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 465
-EMAIL_FROM = "sambhajimene@gmail.com"
-EMAIL_PASSWORD = "jgebigpsoeqqwrfa"
-EMAIL_TO = ["sambhajimene@gmail.com"]
-
-BODY_THRESHOLD = 0.2
-SLEEP_INTERVAL = 0.2
-
-START_DAILY = datetime.date.today() - datetime.timedelta(days=120)
-START_WEEKLY = datetime.date.today() - datetime.timedelta(days=365)
-START_HOURLY = datetime.date.today() - datetime.timedelta(days=10)
-END_DATE = datetime.date.today()
-
-SIGNAL_STORE_FILE = "last_signals.json"
-
-# ==========================================
-
-kite = KiteConnect(api_key=API_KEY)
-kite.set_access_token(ACCESS_TOKEN)
-
-# ================= HEIKIN ASHI =================
-def calculate_heikin_ashi(df):
-    ha = df.copy()
-
-    ha["HA_Close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
-
-    ha_open = [(df["open"].iloc[0] + df["close"].iloc[0]) / 2]
-    for i in range(1, len(df)):
-        ha_open.append((ha_open[i-1] + ha["HA_Close"].iloc[i-1]) / 2)
-
-    ha["HA_Open"] = ha_open
-    ha["HA_High"] = ha[["high", "HA_Open", "HA_Close"]].max(axis=1)
-    ha["HA_Low"] = ha[["low", "HA_Open", "HA_Close"]].min(axis=1)
-
-    return ha
-# =================================================
-
-
-# ================= EMAIL =================
-def send_email(subject, body):
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(EMAIL_TO)
-
-    try:
-        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-        server.login(EMAIL_FROM, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        server.quit()
-        return True
-    except Exception as e:
-        return str(e)
-
-
-def send_test_email():
-    return send_email(
-        "✅ HA Scanner Test Email",
-        "Your HA Scanner email configuration is working properly."
-    )
-
-
-def send_signal_alert(symbols):
-    body = "🔥 New HA Multi-Timeframe Signals Found:\n\n"
-    for s in symbols:
-        body += f"{s}\n"
-
-    return send_email("🔥 HA Scanner Alert", body)
-# =================================================
-
-
-# ================= SIGNAL MEMORY =================
+import pandas as pd
+import numpy as np
+import datetime as dt
 import json
-import os
+import streamlit as st
 
-SIGNAL_STORE_FILE = "last_signals.json"  # or previous_signals.json
+# -------------------------
+# 1) KiteConnect Setup
+# -------------------------
+KITE_API_KEY = "z9rful06a9890v8m"
+#KITE_API_SECRET = "YOUR_API_SECRET"
+KITE_ACCESS_TOKEN = "X78rnH2NAuTJvEfblvtVShawi4ygf2W9"
 
-DEFAULT_SIGNALS = {
-    "bullish": [],
-    "bearish": []
-}
+kite = KiteConnect(api_key=KITE_API_KEY)
+kite.set_access_token(KITE_ACCESS_TOKEN)
 
-def load_previous_signals():
-    if not os.path.exists(SIGNAL_STORE_FILE) or os.path.getsize(SIGNAL_STORE_FILE) == 0:
-        return DEFAULT_SIGNALS.copy()
-    
-    try:
-        with open(SIGNAL_STORE_FILE, "r") as f:
-            data = json.load(f)
-            # Ensure it's a dict with correct keys
-            if not isinstance(data, dict):
-                return DEFAULT_SIGNALS.copy()
-            if "bullish" not in data:
-                data["bullish"] = []
-            if "bearish" not in data:
-                data["bearish"] = []
-            return data
-    except json.JSONDecodeError:
-        # If JSON is corrupted, return default
-        return DEFAULT_SIGNALS.copy()
+# -------------------------
+# 2) Indicator Functions
+# -------------------------
+def heikin_ashi(df):
+    ha = df.copy()
+    ha["HA_Close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+    ha["HA_Open"] = (df["open"].shift(1) + df["close"].shift(1)) / 2
+    ha["HA_High"] = ha[["HA_Open","HA_Close", "high"]].max(axis=1)
+    ha["HA_Low"] = ha[["HA_Open","HA_Close", "low"]].min(axis=1)
+    ha.fillna(method="bfill", inplace=True)
+    return ha
 
-def save_signals(signals):
-    # Ensure signals always have the correct keys
-    signals_to_save = {
-        "bullish": signals.get("bullish", []),
-        "bearish": signals.get("bearish", [])
-    }
-    with open(SIGNAL_STORE_FILE, "w") as f:
-        json.dump(signals_to_save, f, indent=4)
-# =================================================
+def EMA(df, period=50):
+    return df["close"].ewm(span=period, adjust=False).mean()
 
+def RSI(df, period=14):
+    delta = df["close"].diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(period).mean()
+    avg_loss = pd.Series(loss).rolling(period).mean()
+    rs = avg_gain/avg_loss
+    return 100 - (100/(1+rs))
 
-# ================= SCANNER =================
-def scan_market():
+def ADX(df, period=14):
+    df["TR"] = np.maximum.reduce([
+        df["high"]-df["low"],
+        abs(df["high"] - df["close"].shift()),
+        abs(df["low"] - df["close"].shift())
+    ])
+    df["+DM"] = np.where(df["high"].diff() > df["low"].diff(), np.maximum(df["high"].diff(),0), 0)
+    df["-DM"] = np.where(df["low"].diff() > df["high"].diff(), np.maximum(df["low"].diff(),0), 0)
+    TR_sma = df["TR"].rolling(period).mean()
+    plus_di = 100 * (df["+DM"].rolling(period).mean()/TR_sma)
+    minus_di = 100 * (df["-DM"].rolling(period).mean()/TR_sma)
+    dx = 100 * abs(plus_di-minus_di)/(plus_di+minus_di)
+    return dx.rolling(period).mean()
 
-    instruments = kite.instruments("NSE")
-    df_instruments = pd.DataFrame(instruments)
+def strong_ha_bullish(row):
+    return (row["HA_Open"] == row["HA_Low"] and row["HA_Close"] > row["HA_Open"])
 
-    nse500_symbols = pd.read_csv(
-        "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-    )["Symbol"].tolist()
+def strong_ha_bearish(row):
+    return (row["HA_Open"] == row["HA_High"] and row["HA_Close"] < row["HA_Open"])
 
-    df_nse500 = df_instruments[
-        (df_instruments["segment"] == "NSE") &
-        (df_instruments["instrument_type"] == "EQ") &
-        (df_instruments["tradingsymbol"].isin(nse500_symbols))
-    ]
+# -------------------------
+# 3) Fetch OHLC From Kite
+# -------------------------
+def get_ohlc(kite_symbol, interval, from_date, to_date):
+    data = kite.historical_data(kite_symbol, from_date, to_date, interval)
+    df = pd.DataFrame(data)
+    df.rename(columns={"date":"Datetime"}, inplace=True)
+    df.set_index("Datetime", inplace=True)
+    return df
 
-    results = []
+def fetch_data(symbol):
+    today = dt.date.today()
+    wk_ago = today - dt.timedelta(days=365*3)
+    df_weekly = get_ohlc(symbol, "week", wk_ago, today)
+    df_daily = get_ohlc(symbol, "day", wk_ago, today)
+    df_hourly = get_ohlc(symbol, "hour", today - dt.timedelta(days=30), today)
+    return df_weekly, df_daily, df_hourly
 
-    for _, row in df_nse500.iterrows():
+# -------------------------
+# 4) Signal Logic
+# -------------------------
+def scan_symbol(symbol):
+    df_weekly, df_daily, df_hourly = fetch_data(symbol)
+    ha_w = heikin_ashi(df_weekly)
+    ha_d = heikin_ashi(df_daily)
+    ha_h = heikin_ashi(df_hourly)
 
-        symbol = row["tradingsymbol"]
-        token = row["instrument_token"]
+    ha_d["EMA50"] = EMA(ha_d)
+    ha_d["EMA50_slope"] = ha_d["EMA50"].diff()
+    ha_h["EMA50"] = EMA(ha_h)
+    ha_h["RSI"] = RSI(ha_h)
+    ha_h["ADX"] = ADX(ha_h)
 
+    signals = []
+
+    # Multi‑timeframe check
+    if len(ha_w)>1 and len(ha_d)>1 and len(ha_h)>1:
+        week_bull = strong_ha_bullish(ha_w.iloc[-1])
+        week_bear = strong_ha_bearish(ha_w.iloc[-1])
+
+        daily_bull = strong_ha_bullish(ha_d.iloc[-1]) or ha_d["HA_Close"].iloc[-1] >= ha_d["HA_Open"].iloc[-1]
+        daily_bear = strong_ha_bearish(ha_d.iloc[-1]) or ha_d["HA_Close"].iloc[-1] <= ha_d["HA_Open"].iloc[-1]
+        daily_ema_rising = ha_d["EMA50_slope"].iloc[-1] > 0
+
+        price = ha_h["close"].iloc[-1]
+        ema50 = ha_h["EMA50"].iloc[-1]
+        rsi = ha_h["RSI"].iloc[-1]
+        adx = ha_h["ADX"].iloc[-1]
+
+        # RSI Condition
+        bullish_rsi = (40<=rsi<=60) or (rsi > 60)
+        bearish_rsi = (40<=rsi<=60) or (rsi < 40)
+
+        support = abs(price - ema50) <= 0.5*ema50/100
+        resistance = abs(price - ema50) <= 0.5*ema50/100
+
+        if week_bull and daily_bull and daily_ema_rising and support and price>ema50 and bullish_rsi and adx>adx:
+            signals.append({
+                "symbol": symbol,
+                "signal": "Bullish",
+                "time": dt.datetime.now().isoformat()
+            })
+        if week_bear and daily_bear and daily_ema_rising and resistance and price<ema50 and bearish_rsi and adx>adx:
+            signals.append({
+                "symbol": symbol,
+                "signal": "Bearish",
+                "time": dt.datetime.now().isoformat()
+            })
+
+    return signals
+
+# -------------------------
+# 5) Scanner Runner
+# -------------------------
+signal_store = []
+
+def run_scanner(symbols):
+    global signal_store
+    for sym in symbols:
+        kite_sym = f"NSE:{sym}"
         try:
-            # ================= DAILY =================
-            daily = pd.DataFrame(
-                kite.historical_data(token, START_DAILY, END_DATE, "day")
-            )
-            if len(daily) < 60:
-                continue
+            sigs = scan_symbol(kite_sym)
+            signal_store.extend(sigs)
+        except Exception as e:
+            print(f"Error {sym}: {str(e)}")
+    with open("live_ha_signals.json","w") as f:
+        json.dump(signal_store, f, indent=4)
 
-            daily["EMA50"] = daily["close"].ewm(span=50).mean()
-            ha_daily = calculate_heikin_ashi(daily)
-            d = ha_daily.iloc[-1]
+# -------------------------
+# 6) Streamlit Dashboard
+# -------------------------
+st.title("📊 LIVE NSE500 Heikin‑Ashi Scanner")
 
-            body = abs(d["HA_Close"] - d["HA_Open"])
-            full_range = d["HA_High"] - d["HA_Low"]
-            if full_range == 0:
-                continue
+symbols_txt = st.text_input("Enter symbols comma separated:", "RELIANCE,TCS,HDFC")
+symbols_list = [s.strip().upper() for s in symbols_txt.split(",")]
 
-            body_ratio = body / full_range
-            upper_wick = d["HA_High"] - max(d["HA_Open"], d["HA_Close"])
-            lower_wick = min(d["HA_Open"], d["HA_Close"]) - d["HA_Low"]
-            price_above_ema = d["close"] > d["EMA50"]
+if st.button("Run Live Scan"):
+    run_scanner(symbols_list)
+    st.success("Scan completed!")
 
-            daily_neutral = (
-                body_ratio < BODY_THRESHOLD and
-                upper_wick > 0 and
-                lower_wick > 0 and
-                price_above_ema
-            )
+if signal_store:
+    df_sigs = pd.DataFrame(signal_store)
+    st.dataframe(df_sigs)
 
-            daily_strong = (
-                d["HA_Close"] > d["HA_Open"] and
-                lower_wick <= (body * 0.1) and
-                body_ratio > 0.5 and
-                price_above_ema
-            )
-
-            if not (daily_neutral or daily_strong):
-                continue
-
-            # ================= WEEKLY =================
-            weekly = pd.DataFrame(
-                kite.historical_data(token, START_WEEKLY, END_DATE, "week")
-            )
-            if len(weekly) < 10:
-                continue
-
-            ha_weekly = calculate_heikin_ashi(weekly)
-            w = ha_weekly.iloc[-1]
-
-            weekly_body = w["HA_Close"] - w["HA_Open"]
-            weekly_lower_wick = min(w["HA_Open"], w["HA_Close"]) - w["HA_Low"]
-
-            weekly_strong = (
-                weekly_body > 0 and
-                weekly_lower_wick <= (weekly_body * 0.1)
-            )
-
-            if not weekly_strong:
-                continue
-
-            # ================= HOURLY =================
-            hourly = pd.DataFrame(
-                kite.historical_data(token, START_HOURLY, END_DATE, "60minute")
-            )
-            if len(hourly) < 20:
-                continue
-
-            # ===== ADD EMA50 =====
-            hourly["EMA50"] = hourly["close"].ewm(span=50).mean()
-
-            ha_hourly = calculate_heikin_ashi(hourly)
-            h = ha_hourly.iloc[-1]
-
-            ema = hourly["EMA50"].iloc[-1]
-            last_candle = hourly.iloc[-1]
-
-            hourly_body = h["HA_Close"] - h["HA_Open"]
-            hourly_lower_wick = min(h["HA_Open"], h["HA_Close"]) - h["HA_Low"]
-            hourly_range = h["HA_High"] - h["HA_Low"]
-
-            if hourly_range == 0:
-                continue
-
-            hourly_strong = (
-                hourly_body > 0 and
-                hourly_lower_wick <= (hourly_body * 0.1) and
-                (hourly_body / hourly_range) > 0.5
-            )
-
-            # ===== NEW EMA CONDITIONS =====
-            ema_support = (
-                last_candle["low"] <= ema * 1.002 and
-                last_candle["close"] > ema
-            )
-
-            failed_breakdown = (
-                last_candle["low"] < ema and
-                last_candle["close"] > ema
-            )
-
-            if hourly_strong and (ema_support or failed_breakdown):
-                results.append(symbol)
-
-        except:
-            continue
-
-    return results
-# =================================================
-
-
-# ================= STREAMLIT UI =================
-
-st.set_page_config(layout="wide")
-st.title("🔥 HA Scanner")
-
-st.sidebar.title("⚙ Settings")
-auto_mode = st.sidebar.checkbox("Enable Auto Scan Every Hour")
-
-if auto_mode:
-    st_autorefresh(interval=3600000, limit=None, key="refresh")
-
-col1, col2 = st.columns(2)
-
-run_scan = col1.button("🚀 Run Scan Now")
-test_mail = col2.button("📧 Send Test Mail")
-
-if test_mail:
-    result = send_test_email()
-    if result == True:
-        st.success("Test Email Sent Successfully!")
-    else:
-        st.error(result)
-
-if run_scan or auto_mode:
-
-    with st.spinner("Scanning NSE500... Please wait..."):
-        current_signals = scan_market()
-
-    previous_signals = load_previous_signals()
-    new_signals = list(set(current_signals) - set(previous_signals))
-
-    if current_signals:
-        st.success(f"Found {len(current_signals)} Signals")
-        st.write(current_signals)
-    else:
-        st.warning("No setups found.")
-
-    if new_signals:
-        email_status = send_signal_alert(new_signals)
-        if email_status == True:
-            st.success(f"📬 Email Alert Sent for {len(new_signals)} New Signals")
-        else:
-            st.error(email_status)
-
-    save_signals(current_signals)
-
-st.markdown("---")
-st.caption("Weekly Strong + Daily (Neutral or Strong) Above EMA50 + Hourly Strong + EMA Support/Failed Breakdown")
+st.write("Signals are also saved in `live_ha_signals.json`")
