@@ -5,10 +5,9 @@ import json
 import streamlit as st
 from kiteconnect import KiteConnect
 import time
-from nse500_symbols import nse500_symbols
 
 # -------------------------
-# KiteConnect setup
+# 1) KiteConnect Setup
 # -------------------------
 KITE_API_KEY = "z9rful06a9890v8m"
 #KITE_API_SECRET = "YOUR_API_SECRET"
@@ -17,11 +16,19 @@ KITE_ACCESS_TOKEN = "X78rnH2NAuTJvEfblvtVShawi4ygf2W9"
 kite = KiteConnect(api_key=KITE_API_KEY)
 kite.set_access_token(KITE_ACCESS_TOKEN)
 
-SIGNAL_STORE_FILE = "/app/live_ha_signals.json"  # Docker friendly
-signal_store = []
+# -------------------------
+# 2) NSE500 Symbols (hardcoded fallback)
+# -------------------------
+nse500_symbols = [
+    "RELIANCE","TCS","HDFC","INFY","ICICIBANK","LT","AXISBANK",
+    "WIPRO","HCLTECH","KOTAKBANK","ITC","SBIN","BAJFINANCE",
+    # ... baki NSE500 symbols
+]
+
+SIGNAL_STORE_FILE = "/app/live_ha_signals.json"  # Docker-friendly
 
 # -------------------------
-# Indicator functions
+# 3) Indicator Functions
 # -------------------------
 def heikin_ashi(df):
     ha = df.copy()
@@ -65,7 +72,7 @@ def strong_ha_bearish(row):
     return row["HA_Open"]==row["HA_High"] and row["HA_Close"]<row["HA_Open"]
 
 # -------------------------
-# Fetch OHLC from Kite
+# 4) Fetch OHLC from Kite
 # -------------------------
 def get_ohlc(kite_symbol, interval, from_date, to_date):
     data = kite.historical_data(kite_symbol, from_date, to_date, interval)
@@ -75,7 +82,7 @@ def get_ohlc(kite_symbol, interval, from_date, to_date):
     return df
 
 # -------------------------
-# Scan single symbol
+# 5) Scan single symbol
 # -------------------------
 def scan_symbol(symbol):
     try:
@@ -120,15 +127,16 @@ def scan_symbol(symbol):
 
         return signals
     except Exception as e:
-        print(f"Error {symbol}: {e}")
+        print(f"Error scanning {symbol}: {e}")
         return []
 
 # -------------------------
-# Auto NSE500 scan
+# 6) Auto NSE500 scan
 # -------------------------
 st.title("📊 AUTO NSE500 Heikin-Ashi Scanner")
+
 if st.button("Run Full Auto Scan"):
-    global signal_store
+    signal_store = []  # local store for this run
     for sym in nse500_symbols:
         sigs = scan_symbol(sym)
         signal_store.extend(sigs)
