@@ -16,16 +16,17 @@ KITE_ACCESS_TOKEN = "X78rnH2NAuTJvEfblvtVShawi4ygf2W9"
 kite = KiteConnect(api_key=KITE_API_KEY)
 kite.set_access_token(KITE_ACCESS_TOKEN)
 
-# -------------------------
-# 2) NSE500 Symbols (hardcoded fallback)
-# -------------------------
-nse500_symbols = [
-    "RELIANCE","TCS","HDFC","INFY","ICICIBANK","LT","AXISBANK",
-    "WIPRO","HCLTECH","KOTAKBANK","ITC","SBIN","BAJFINANCE",
-    # ... baki NSE500 symbols
-]
-
 SIGNAL_STORE_FILE = "/app/live_ha_signals.json"  # Docker-friendly
+
+# -------------------------
+# 2) Fetch NSE Symbols from Zerodha
+# -------------------------
+def get_nse_equity_symbols():
+    instruments = kite.instruments("NSE")
+    df = pd.DataFrame(instruments)
+    # Filter only equity stocks
+    nse_symbols = df[(df["exchange"]=="NSE") & (df["instrument_type"]=="EQ")]["tradingsymbol"].tolist()
+    return nse_symbols
 
 # -------------------------
 # 3) Indicator Functions
@@ -120,9 +121,11 @@ def scan_symbol(symbol):
         support = abs(price-ema50)<=0.5*ema50/100
         resistance = abs(price-ema50)<=0.5*ema50/100
 
-        if week_bull and daily_bull and daily_ema_rising and support and price>ema50 and bullish_rsi and adx>adx:
+        adx_increasing = ha_h["ADX"].iloc[-1] > ha_h["ADX"].iloc[-2]  # fix previous adx>adx
+
+        if week_bull and daily_bull and daily_ema_rising and support and price>ema50 and bullish_rsi and adx_increasing:
             signals.append({"symbol":symbol,"signal":"Bullish","time":dt.datetime.now().isoformat()})
-        if week_bear and daily_bear and daily_ema_rising and resistance and price<ema50 and bearish_rsi and adx>adx:
+        if week_bear and daily_bear and daily_ema_rising and resistance and price<ema50 and bearish_rsi and adx_increasing:
             signals.append({"symbol":symbol,"signal":"Bearish","time":dt.datetime.now().isoformat()})
 
         return signals
@@ -131,13 +134,16 @@ def scan_symbol(symbol):
         return []
 
 # -------------------------
-# 6) Auto NSE500 scan
+# 6) Auto NSE scan
 # -------------------------
-st.title("📊 AUTO NSE500 Heikin-Ashi Scanner")
+st.title("📊 AUTO NSE Heikin-Ashi Scanner")
 
 if st.button("Run Full Auto Scan"):
-    signal_store = []  # local store for this run
-    for sym in nse500_symbols:
+    signal_store = []
+    nse_symbols = get_nse_equity_symbols()  # Auto fetch all NSE equities
+    st.write(f"Total symbols fetched: {len(nse_symbols)}")
+
+    for sym in nse_symbols:
         sigs = scan_symbol(sym)
         signal_store.extend(sigs)
         st.write(f"{sym}: {len(sigs)} signals")
