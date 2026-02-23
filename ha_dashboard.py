@@ -11,7 +11,7 @@ import time
 # -------------------------
 KITE_API_KEY = "z9rful06a9890v8m"
 #KITE_API_SECRET = "YOUR_API_SECRET"
-KITE_ACCESS_TOKEN = "X78rnH2NAuTJvEfblvtVShawi4ygf2W9"
+KITE_ACCESS_TOKEN = "3h5XsQt9h1nlfZA56fBrOmLHboaVaKnw"
 
 kite = KiteConnect(api_key=KITE_API_KEY)
 kite.set_access_token(KITE_ACCESS_TOKEN)
