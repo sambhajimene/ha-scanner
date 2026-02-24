@@ -3,3 +3,7 @@ pandas
 kiteconnect
 streamlit-autorefresh
 requests
+numpy
+flask
+streamlit
+yfinance
