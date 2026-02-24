@@ -10,7 +10,7 @@ env:
   IMAGE_NAME: quay.io/menesambhaji/ha-scanner
   OPENSHIFT_PROJECT: menesambhaji-dev
   APP_NAME: ha-scanner
-  APP_PORT: 8501
+  APP_PORT: 8877
 
 jobs:
   build_and_push:
