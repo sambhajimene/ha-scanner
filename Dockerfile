@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Dashboard port
-EXPOSE 8877
+EXPOSE 8501
 
 # Run scanner
 CMD ["python", "ha_scanner.py"]
