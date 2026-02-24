@@ -1,27 +1,19 @@
-
-# -----------------------------
-# HA Scanner Dashboard Docker
-# -----------------------------
 FROM python:3.11-slim
-
-# System settings
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Copy requirements first (cache optimization)
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy full project
 COPY . .
 
-# Dashboard port
-EXPOSE 8501
+# Create writable directory for OpenShift
+RUN mkdir -p /app/data \
+    && chmod -R 775 /app \
+    && chgrp -R 0 /app
 
-# Run scanner
+EXPOSE 8877
+
 CMD ["python", "ha_scanner.py"]
 ########################################################################################
 # FROM python:3.11
